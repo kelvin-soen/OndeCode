@@ -37,7 +37,8 @@ pub async fn run(yolo: bool) -> anyhow::Result<()> {
         config = config.arg("--yolo");
     }
     let cwd = std::env::current_dir()?;
-    let model = crate::llm::LlmConfig::from_env().model;
+    let llm = crate::llm::LlmConfig::from_env();
+    let model = format!("{} · {}", llm.provider.name(), llm.model);
     let (tx, rx) = mpsc::unbounded_channel();
 
     agent_client_protocol::Client

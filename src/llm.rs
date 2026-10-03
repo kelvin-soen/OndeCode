@@ -5,36 +5,146 @@ use futures::StreamExt;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+/// Where completions come from. All are OpenAI-compatible; they differ in default endpoint,
+/// default model, and which key authenticates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Provider {
+    OpenAi,
+    /// condense.chat: serves its own models on the condense key.
+    Condense,
+    /// Onde Cloud (ondeinference.com): bearer token is `app-id:app-secret`.
+    Onde,
+}
+
+impl Provider {
+    fn parse(name: &str) -> Option<Self> {
+        match name.to_ascii_lowercase().as_str() {
+            "openai" => Some(Self::OpenAi),
+            "condense" => Some(Self::Condense),
+            "onde" | "onde-cloud" | "ondeinference" => Some(Self::Onde),
+            _ => None,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::OpenAi => "openai",
+            Self::Condense => "condense",
+            Self::Onde => "onde",
+        }
+    }
+
+    fn key_var(self) -> &'static str {
+        match self {
+            Self::OpenAi => "OPENAI_API_KEY",
+            Self::Condense => "CONDENSE_API_KEY",
+            Self::Onde => "ONDE_API_KEY",
+        }
+    }
+
+    fn default_base_url(self) -> &'static str {
+        match self {
+            Self::OpenAi => "https://api.openai.com/v1",
+            Self::Condense => "https://api.condense.chat/openai/v1",
+            Self::Onde => "https://cloud.ondeinference.com/v1",
+        }
+    }
+
+    fn default_model(self) -> &'static str {
+        match self {
+            Self::OpenAi => "gpt-4o-mini",
+            Self::Condense => "google/gemini-3.8-flash",
+            Self::Onde => "onde-balanced",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct LlmConfig {
+    pub provider: Provider,
     pub base_url: String,
     pub api_key: Option<String>,
     pub model: String,
-    /// condense.chat key. Sent as `X-Condense-Auth-Token`; also used as the bearer key when
-    /// `OPENAI_API_KEY` is unset, since condense serves its own models on the condense key.
+    /// condense.chat key, sent as `X-Condense-Auth-Token` when the provider is condense.
     pub condense_key: Option<String>,
 }
 
 impl LlmConfig {
+    /// Picks the provider from `ONDE_CODE_PROVIDER`, or else from whichever key is set
+    /// (`ONDE_API_KEY`, then `CONDENSE_API_KEY`, then plain OpenAI). `OPENAI_BASE_URL`,
+    /// `OPENAI_API_KEY` and `OPENAI_MODEL` override the provider's defaults.
     pub fn from_env() -> Self {
-        let condense_key = std::env::var("CONDENSE_API_KEY").ok().filter(|k| !k.is_empty());
-        let (default_base, default_model) = if condense_key.is_some() {
-            ("https://api.condense.chat/openai/v1", "google/gemini-3.8-flash")
-        } else {
-            ("https://api.openai.com/v1", "gpt-4o-mini")
+        Self::from_lookup(|name| std::env::var(name).ok())
+    }
+
+    fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Self {
+        let env = |name: &str| lookup(name).filter(|v| !v.is_empty());
+        let provider = match env("ONDE_CODE_PROVIDER") {
+            Some(name) => Provider::parse(&name).unwrap_or_else(|| {
+                tracing::warn!("unknown ONDE_CODE_PROVIDER {name:?}; using openai");
+                Provider::OpenAi
+            }),
+            None if env("ONDE_API_KEY").is_some() => Provider::Onde,
+            None if env("CONDENSE_API_KEY").is_some() => Provider::Condense,
+            None => Provider::OpenAi,
         };
         Self {
-            base_url: std::env::var("OPENAI_BASE_URL")
-                .unwrap_or_else(|_| default_base.into())
+            provider,
+            base_url: env("OPENAI_BASE_URL")
+                .unwrap_or_else(|| provider.default_base_url().into())
                 .trim_end_matches('/')
                 .to_string(),
-            api_key: std::env::var("OPENAI_API_KEY")
-                .ok()
-                .filter(|k| !k.is_empty())
-                .or_else(|| condense_key.clone()),
-            model: std::env::var("OPENAI_MODEL").unwrap_or_else(|_| default_model.into()),
-            condense_key,
+            api_key: env("OPENAI_API_KEY").or_else(|| env(provider.key_var())),
+            model: env("OPENAI_MODEL").unwrap_or_else(|| provider.default_model().into()),
+            condense_key: (provider == Provider::Condense)
+                .then(|| env("CONDENSE_API_KEY"))
+                .flatten(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config(vars: &[(&str, &str)]) -> LlmConfig {
+        LlmConfig::from_lookup(|name| vars.iter().find(|(k, _)| *k == name).map(|(_, v)| v.to_string()))
+    }
+
+    #[test]
+    fn onde_key_selects_onde_cloud() {
+        let c = config(&[("ONDE_API_KEY", "app:secret")]);
+        assert_eq!(c.provider, Provider::Onde);
+        assert_eq!(c.base_url, "https://cloud.ondeinference.com/v1");
+        assert_eq!(c.api_key.as_deref(), Some("app:secret"));
+        assert_eq!(c.model, "onde-balanced");
+        assert_eq!(c.condense_key, None);
+    }
+
+    #[test]
+    fn condense_key_selects_condense() {
+        let c = config(&[("CONDENSE_API_KEY", "ck")]);
+        assert_eq!(c.provider, Provider::Condense);
+        assert_eq!(c.base_url, "https://api.condense.chat/openai/v1");
+        assert_eq!(c.api_key.as_deref(), Some("ck"));
+        assert_eq!(c.condense_key.as_deref(), Some("ck"));
+    }
+
+    #[test]
+    fn explicit_provider_wins_over_detected_keys() {
+        let vars = [("ONDE_API_KEY", "app:secret"), ("CONDENSE_API_KEY", "ck"), ("ONDE_CODE_PROVIDER", "condense")];
+        let c = config(&vars);
+        assert_eq!(c.provider, Provider::Condense);
+        assert_eq!(c.api_key.as_deref(), Some("ck"));
+        assert_eq!(config(&[("ONDE_CODE_PROVIDER", "onde"), ("CONDENSE_API_KEY", "ck")]).api_key, None);
+    }
+
+    #[test]
+    fn openai_overrides_apply_to_any_provider() {
+        let c = config(&[("ONDE_API_KEY", "app:secret"), ("OPENAI_MODEL", "onde-prism"), ("OPENAI_BASE_URL", "http://x/v1/")]);
+        assert_eq!((c.base_url.as_str(), c.model.as_str()), ("http://x/v1", "onde-prism"));
+        let plain = config(&[]);
+        assert_eq!((plain.provider, plain.model.as_str()), (Provider::OpenAi, "gpt-4o-mini"));
     }
 }
 

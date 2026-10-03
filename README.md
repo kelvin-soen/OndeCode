@@ -24,24 +24,40 @@ cargo build --release   # -> target/release/onde-code
 
 ## Configuration
 
-| Env var            | Default                     |                                    |
-|--------------------|-----------------------------|------------------------------------|
-| `OPENAI_BASE_URL`  | `https://api.openai.com/v1` | any OpenAI-compatible base URL (defaults to `https://api.condense.chat/openai/v1` when `CONDENSE_API_KEY` is set) |
-| `OPENAI_API_KEY`   | `CONDENSE_API_KEY`          | sent as a Bearer token if set      |
-| `OPENAI_MODEL`     | `gpt-4o-mini` (`google/gemini-3.8-flash` with condense) | must support tool/function calling |
-| `CONDENSE_API_KEY` | unset                       | [condense.chat](https://condense.chat) key, sent as `X-Condense-Auth-Token` with the ACP session id as `X-Condense-Session-Id`. On its own it is enough: condense serves its models (billed to your condense credit) on this key, so no upstream key is needed |
+### Providers
 
-### Using Gemini through condense
+Any OpenAI-compatible `/chat/completions` endpoint works. Three are built in; the provider is
+picked from `ONDE_CODE_PROVIDER` if set, otherwise from whichever key is present, in this order:
+
+| Provider | Key env var | Base URL | Default model |
+|----------|-------------|----------|---------------|
+| `onde` — [Onde Cloud](https://ondeinference.com/cloud) | `ONDE_API_KEY` (`app-id:app-secret` from the Onde dashboard) | `https://cloud.ondeinference.com/v1` | `onde-balanced` |
+| `condense` — [condense.chat](https://condense.chat) | `CONDENSE_API_KEY` | `https://api.condense.chat/openai/v1` | `google/gemini-3.8-flash` |
+| `openai` | `OPENAI_API_KEY` | `https://api.openai.com/v1` | `gpt-4o-mini` |
 
 ```sh
-export CONDENSE_API_KEY=YOUR_CONDENSE_API_KEY   # from the condense dashboard; never commit it
-./target/release/onde-code                      # uses google/gemini-3.8-flash
+ONDE_API_KEY=YOUR_APP_ID:YOUR_APP_SECRET ./target/release/onde-code     # Onde Cloud
+CONDENSE_API_KEY=YOUR_CONDENSE_API_KEY ./target/release/onde-code       # Gemini via condense
 ```
 
+Onde Cloud models are tier ids (`onde-fast`, `onde-balanced`, `onde-large`, `onde-prism`, …;
+see `GET https://cloud.ondeinference.com/v1/models`). Pick one with `OPENAI_MODEL`.
+
+With condense, the key is also sent as `X-Condense-Auth-Token` with the ACP session id as
+`X-Condense-Session-Id`; condense serves its own models on that key, so no upstream key is needed.
 Gemini's per-tool-call `thought_signature` (`extra_content`) is preserved and sent back with the
 conversation history, which Gemini requires for multi-step tool use.
-| `ONDE_CODE_YOLO`   | unset                       | `1` skips permission prompts       |
-| `RUST_LOG`         | unset                       | logs go to stderr                  |
+
+### Environment variables
+
+| Env var              | Default                  |                                              |
+|----------------------|--------------------------|----------------------------------------------|
+| `ONDE_CODE_PROVIDER` | detected from keys       | `onde`, `condense` or `openai`               |
+| `OPENAI_BASE_URL`    | the provider's base URL  | any OpenAI-compatible base URL               |
+| `OPENAI_API_KEY`     | the provider's key       | sent as a Bearer token; overrides the provider key |
+| `OPENAI_MODEL`       | the provider's model     | must support tool/function calling           |
+| `ONDE_CODE_YOLO`     | unset                    | `1` skips permission prompts                 |
+| `RUST_LOG`           | unset                    | logs go to stderr                            |
 
 ## Use from the terminal
 
