@@ -146,6 +146,25 @@ mod tests {
         let plain = config(&[]);
         assert_eq!((plain.provider, plain.model.as_str()), (Provider::OpenAi, "gpt-4o-mini"));
     }
+
+    #[test]
+    fn parses_models_response() {
+        let body = r#"{
+            "object": "list",
+            "data": [
+                {"id": "onde-balanced", "object": "model", "created": 1700000000, "owned_by": "onde"},
+                {"id": "onde-fast", "object": "model", "created": 1700000001, "owned_by": "onde"},
+                {"id": "custom-model"}
+            ]
+        }"#;
+        let parsed: ModelsResponse = serde_json::from_str(body).unwrap();
+        assert_eq!(parsed.data.len(), 3);
+        assert_eq!(parsed.data[0].id, "onde-balanced");
+        assert_eq!(parsed.data[0].owned_by.as_deref(), Some("onde"));
+        // Missing optional fields must not fail parsing.
+        assert_eq!(parsed.data[2].id, "custom-model");
+        assert_eq!(parsed.data[2].owned_by, None);
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -233,6 +252,19 @@ struct FunctionDelta {
     arguments: Option<String>,
 }
 
+/// A model from `GET /v1/models`. Extra fields in the response are ignored.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ModelInfo {
+    pub id: String,
+    #[serde(default)]
+    pub owned_by: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ModelsResponse {
+    data: Vec<ModelInfo>,
+}
+
 #[derive(Debug, Clone)]
 pub struct LlmClient {
     http: reqwest::Client,
@@ -246,6 +278,23 @@ impl LlmClient {
 
     pub fn model(&self) -> &str {
         &self.config.model
+    }
+
+    /// List the models the configured endpoint serves (`GET {base_url}/models`).
+    pub async fn models(&self) -> Result<Vec<ModelInfo>> {
+        let mut req = self.http.get(format!("{}/models", self.config.base_url));
+        if let Some(key) = &self.config.api_key {
+            req = req.bearer_auth(key);
+        }
+        let resp = req.send().await.context("sending models request")?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            bail!("models endpoint returned {status}: {text}");
+        }
+        let mut models = resp.json::<ModelsResponse>().await.context("parsing models response")?.data;
+        models.sort_by(|a, b| a.id.cmp(&b.id));
+        Ok(models)
     }
 
     /// Run one streaming chat completion, invoking `on_delta` for every text fragment.

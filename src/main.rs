@@ -211,11 +211,12 @@ fn prompt_to_text(blocks: &[ContentBlock]) -> String {
 }
 
 const USAGE: &str = "\
-Usage: onde-code [--acp] [--yolo]
+Usage: onde-code [--acp] [--yolo] [--list-models]
 
-  (no args)  interactive terminal UI (when run from a terminal)
-  --acp      speak ACP over stdio for an editor (default when stdin is not a terminal)
-  --yolo     approve file edits and commands without asking
+  (no args)      interactive terminal UI (when run from a terminal)
+  --acp          speak ACP over stdio for an editor (default when stdin is not a terminal)
+  --yolo         approve file edits and commands without asking
+  --list-models  list the models the configured endpoint serves, then exit
 ";
 
 #[tokio::main]
@@ -226,13 +227,27 @@ async fn main() -> anyhow::Result<()> {
         print!("{USAGE}");
         return Ok(());
     }
-    if let Some(bad) = args.iter().find(|a| !["--acp", "--yolo"].contains(&a.as_str())) {
+    if let Some(bad) = args.iter().find(|a| !["--acp", "--yolo", "--list-models"].contains(&a.as_str())) {
         anyhow::bail!("unknown argument {bad}\n\n{USAGE}");
     }
-    if has("--acp") || !std::io::stdin().is_terminal() {
+    if has("--list-models") {
+        list_models().await?;
+    } else if has("--acp") || !std::io::stdin().is_terminal() {
         run_agent(has("--yolo")).await?;
     } else {
         tui::run(has("--yolo")).await?;
+    }
+    Ok(())
+}
+
+async fn list_models() -> anyhow::Result<()> {
+    let client = LlmClient::new(LlmConfig::from_env());
+    let models = client.models().await?;
+    for m in models {
+        match m.owned_by {
+            Some(owner) => println!("{}\t{}", m.id, owner),
+            None => println!("{}", m.id),
+        }
     }
     Ok(())
 }
