@@ -112,10 +112,17 @@ impl LlmConfig {
 fn load_config_env_vars() -> std::collections::HashMap<String, String> {
     // If the process environment already provides any LLM credentials/provider,
     // prefer the environment directly without falling back to the config file.
-    let has_env_config = std::env::var("ONDE_CODE_PROVIDER").is_ok()
-        || std::env::var("ONDE_API_KEY").is_ok()
-        || std::env::var("CONDENSE_API_KEY").is_ok()
-        || std::env::var("OPENAI_API_KEY").is_ok();
+    //
+    // Empty strings don't count — GUI launchers (e.g. Zed via launchd) often
+    // export variables set to "", and treating those as "present" would skip
+    // the config file and silently fall back to OpenAI defaults.
+    let env_nonempty = |name: &str| {
+        std::env::var(name).map(|v| !v.is_empty()).unwrap_or(false)
+    };
+    let has_env_config = env_nonempty("ONDE_CODE_PROVIDER")
+        || env_nonempty("ONDE_API_KEY")
+        || env_nonempty("CONDENSE_API_KEY")
+        || env_nonempty("OPENAI_API_KEY");
 
     let mut vars = std::collections::HashMap::new();
     if has_env_config {
