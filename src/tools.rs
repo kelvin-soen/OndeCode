@@ -1,0 +1,389 @@
+//! Coding tools exposed to the model. File and shell operations are routed through the
+//! ACP client (so the editor sees unsaved buffers and owns the terminal) when the client
+//! advertises support, and fall back to the local filesystem/process otherwise.
+
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use agent_client_protocol::schema::v1::{
+    ClientCapabilities, CreateTerminalRequest, Diff, KillTerminalRequest, PermissionOption,
+    PermissionOptionKind, ReadTextFileRequest, ReleaseTerminalRequest, RequestPermissionOutcome,
+    RequestPermissionRequest, SessionId, SessionNotification, SessionUpdate, Terminal,
+    TerminalOutputRequest, ToolCallContent, ToolCallLocation, ToolCallUpdate,
+    ToolCallUpdateFields, ToolKind, WaitForTerminalExitRequest, WriteTextFileRequest,
+};
+use agent_client_protocol::{Client, ConnectionTo};
+use anyhow::{Context, Result, anyhow, bail};
+use serde::Deserialize;
+use serde_json::{Value, json};
+use tokio_util::sync::CancellationToken;
+
+const MAX_OUTPUT_BYTES: usize = 32 * 1024;
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Everything a tool needs to act on behalf of one session.
+pub struct ToolCtx {
+    pub connection: ConnectionTo<Client>,
+    pub session_id: SessionId,
+    pub cwd: PathBuf,
+    pub caps: ClientCapabilities,
+    pub cancel: CancellationToken,
+    pub yolo: bool,
+    /// Tool names the user chose "always allow" for in this session.
+    pub always_allowed: Arc<Mutex<HashSet<String>>>,
+}
+
+pub struct ToolOutcome {
+    /// Text returned to the model.
+    pub text: String,
+    /// Rich content shown to the user in the client.
+    pub content: Vec<ToolCallContent>,
+    pub failed: bool,
+}
+
+impl ToolOutcome {
+    fn ok(text: impl Into<String>) -> Self {
+        let text = text.into();
+        Self { content: vec![ToolCallContent::from(text.clone())], text, failed: false }
+    }
+    pub fn err(text: impl Into<String>) -> Self {
+        let text = text.into();
+        Self { content: vec![ToolCallContent::from(text.clone())], text, failed: true }
+    }
+}
+
+pub fn definitions() -> Value {
+    let f = |name: &str, desc: &str, params: Value| {
+        json!({ "type": "function", "function": { "name": name, "description": desc, "parameters": params } })
+    };
+    json!([
+        f("read_file", "Read a text file. Paths may be relative to the working directory.", json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string" },
+                "line": { "type": "integer", "description": "1-based line to start from" },
+                "limit": { "type": "integer", "description": "Max lines to read" }
+            },
+            "required": ["path"]
+        })),
+        f("write_file", "Create or overwrite a file with the given content.", json!({
+            "type": "object",
+            "properties": { "path": { "type": "string" }, "content": { "type": "string" } },
+            "required": ["path", "content"]
+        })),
+        f("edit_file", "Replace an exact, unique occurrence of old_string with new_string in a file.", json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string" },
+                "old_string": { "type": "string" },
+                "new_string": { "type": "string" }
+            },
+            "required": ["path", "old_string", "new_string"]
+        })),
+        f("list_directory", "List entries of a directory (directories end with '/').", json!({
+            "type": "object",
+            "properties": { "path": { "type": "string", "description": "Defaults to the working directory" } }
+        })),
+        f("run_command", "Run a shell command (sh -c) in the working directory and return its output.", json!({
+            "type": "object",
+            "properties": { "command": { "type": "string" } },
+            "required": ["command"]
+        })),
+    ])
+}
+
+/// Title, kind and affected locations shown in the client when the call starts.
+pub fn describe(ctx: &ToolCtx, name: &str, args: &Value) -> (String, ToolKind, Vec<ToolCallLocation>) {
+    let path = args.get("path").and_then(Value::as_str).map(|p| ctx.resolve(p));
+    let loc = path.clone().map(ToolCallLocation::new).into_iter().collect();
+    let shown = path.as_deref().map_or_else(|| ctx.cwd.display().to_string(), |p| p.display().to_string());
+    match name {
+        "read_file" => (format!("Read {shown}"), ToolKind::Read, loc),
+        "write_file" => (format!("Write {shown}"), ToolKind::Edit, loc),
+        "edit_file" => (format!("Edit {shown}"), ToolKind::Edit, loc),
+        "list_directory" => (format!("List {shown}"), ToolKind::Search, loc),
+        "run_command" => {
+            let cmd = args.get("command").and_then(Value::as_str).unwrap_or("");
+            (format!("`{cmd}`"), ToolKind::Execute, vec![])
+        }
+        _ => (name.to_string(), ToolKind::Other, vec![]),
+    }
+}
+
+pub async fn execute(ctx: &ToolCtx, tool_call_id: &str, name: &str, args: Value) -> ToolOutcome {
+    let result = match name {
+        "read_file" => ctx.read_file(args).await,
+        "write_file" => ctx.write_file(tool_call_id, args).await,
+        "edit_file" => ctx.edit_file(tool_call_id, args).await,
+        "list_directory" => ctx.list_directory(args).await,
+        "run_command" => ctx.run_command(tool_call_id, args).await,
+        other => Err(anyhow!("unknown tool `{other}`")),
+    };
+    result.unwrap_or_else(|e| ToolOutcome::err(format!("Error: {e:#}")))
+}
+
+#[derive(Deserialize)]
+struct ReadArgs {
+    path: String,
+    line: Option<u32>,
+    limit: Option<u32>,
+}
+#[derive(Deserialize)]
+struct WriteArgs {
+    path: String,
+    content: String,
+}
+#[derive(Deserialize)]
+struct EditArgs {
+    path: String,
+    old_string: String,
+    new_string: String,
+}
+#[derive(Deserialize)]
+struct ListArgs {
+    path: Option<String>,
+}
+#[derive(Deserialize)]
+struct CommandArgs {
+    command: String,
+}
+
+impl ToolCtx {
+    fn resolve(&self, path: &str) -> PathBuf {
+        let p = Path::new(path);
+        if p.is_absolute() { p.to_path_buf() } else { self.cwd.join(p) }
+    }
+
+    async fn read_file(&self, args: Value) -> Result<ToolOutcome> {
+        let a: ReadArgs = serde_json::from_value(args)?;
+        let path = self.resolve(&a.path);
+        let text = if self.caps.fs.read_text_file {
+            let mut req = ReadTextFileRequest::new(self.session_id.clone(), path.clone());
+            if let Some(l) = a.line {
+                req = req.line(l);
+            }
+            if let Some(l) = a.limit {
+                req = req.limit(l);
+            }
+            self.connection.send_request(req).block_task().await?.content
+        } else {
+            let full = tokio::fs::read_to_string(&path)
+                .await
+                .with_context(|| format!("reading {}", path.display()))?;
+            let skip = a.line.map_or(0, |l| l.saturating_sub(1) as usize);
+            let take = a.limit.map_or(usize::MAX, |l| l as usize);
+            full.lines().skip(skip).take(take).collect::<Vec<_>>().join("\n")
+        };
+        // Show the user a short summary; give the model the full text.
+        let mut out = ToolOutcome::ok(format!("{} lines", text.lines().count()));
+        out.text = truncate(text);
+        Ok(out)
+    }
+
+    /// Read the current file contents for diffs/edits; `None` if it doesn't exist.
+    async fn read_existing(&self, path: &Path) -> Option<String> {
+        if self.caps.fs.read_text_file {
+            let req = ReadTextFileRequest::new(self.session_id.clone(), path.to_path_buf());
+            self.connection.send_request(req).block_task().await.ok().map(|r| r.content)
+        } else {
+            tokio::fs::read_to_string(path).await.ok()
+        }
+    }
+
+    async fn write_text(&self, path: &Path, content: &str) -> Result<()> {
+        if self.caps.fs.write_text_file {
+            let req = WriteTextFileRequest::new(self.session_id.clone(), path.to_path_buf(), content);
+            self.connection.send_request(req).block_task().await?;
+        } else {
+            if let Some(parent) = path.parent() {
+                tokio::fs::create_dir_all(parent).await?;
+            }
+            tokio::fs::write(path, content).await?;
+        }
+        Ok(())
+    }
+
+    async fn write_file(&self, id: &str, args: Value) -> Result<ToolOutcome> {
+        let a: WriteArgs = serde_json::from_value(args)?;
+        let path = self.resolve(&a.path);
+        let old = self.read_existing(&path).await;
+        let diff = Diff::new(path.clone(), a.content.clone()).old_text(old);
+        self.apply_edit(id, "write_file", &path, &a.content, diff).await
+    }
+
+    async fn edit_file(&self, id: &str, args: Value) -> Result<ToolOutcome> {
+        let a: EditArgs = serde_json::from_value(args)?;
+        let path = self.resolve(&a.path);
+        let old = self
+            .read_existing(&path)
+            .await
+            .ok_or_else(|| anyhow!("{} does not exist", path.display()))?;
+        match old.matches(&a.old_string).count() {
+            0 => bail!("old_string not found in {}", path.display()),
+            1 => {}
+            n => bail!("old_string occurs {n} times in {}; make it unique", path.display()),
+        }
+        let new = old.replacen(&a.old_string, &a.new_string, 1);
+        let diff = Diff::new(path.clone(), new.clone()).old_text(old);
+        self.apply_edit(id, "edit_file", &path, &new, diff).await
+    }
+
+    async fn apply_edit(&self, id: &str, tool: &str, path: &Path, content: &str, diff: Diff) -> Result<ToolOutcome> {
+        let diff = ToolCallContent::from(diff);
+        if !self.permit(id, tool, vec![diff.clone()]).await? {
+            return Ok(ToolOutcome::err("User rejected this change."));
+        }
+        self.write_text(path, content).await?;
+        Ok(ToolOutcome { text: format!("Wrote {}", path.display()), content: vec![diff], failed: false })
+    }
+
+    async fn list_directory(&self, args: Value) -> Result<ToolOutcome> {
+        let a: ListArgs = serde_json::from_value(args)?;
+        let path = a.path.map_or_else(|| self.cwd.clone(), |p| self.resolve(&p));
+        let mut entries = Vec::new();
+        let mut rd = tokio::fs::read_dir(&path)
+            .await
+            .with_context(|| format!("listing {}", path.display()))?;
+        while let Some(e) = rd.next_entry().await? {
+            let mut name = e.file_name().to_string_lossy().into_owned();
+            if e.file_type().await.is_ok_and(|t| t.is_dir()) {
+                name.push('/');
+            }
+            entries.push(name);
+        }
+        entries.sort();
+        Ok(ToolOutcome::ok(entries.join("\n")))
+    }
+
+    async fn run_command(&self, id: &str, args: Value) -> Result<ToolOutcome> {
+        let a: CommandArgs = serde_json::from_value(args)?;
+        if !self.permit(id, "run_command", vec![]).await? {
+            return Ok(ToolOutcome::err("User rejected running this command."));
+        }
+        if self.caps.terminal { self.run_in_client_terminal(id, &a.command).await } else { self.run_locally(&a.command).await }
+    }
+
+    async fn run_in_client_terminal(&self, id: &str, command: &str) -> Result<ToolOutcome> {
+        let sid = self.session_id.clone();
+        let req = CreateTerminalRequest::new(sid.clone(), "sh")
+            .args(vec!["-c".into(), command.into()])
+            .cwd(self.cwd.clone())
+            .output_byte_limit(MAX_OUTPUT_BYTES as u64);
+        let terminal_id = self.connection.send_request(req).block_task().await?.terminal_id;
+        // Embed the live terminal in the tool call so the user can watch it.
+        let content = vec![ToolCallContent::Terminal(Terminal::new(terminal_id.clone()))];
+        self.update(id, ToolCallUpdateFields::new().content(content.clone()))?;
+
+        let wait = self
+            .connection
+            .send_request(WaitForTerminalExitRequest::new(sid.clone(), terminal_id.clone()))
+            .block_task();
+        let exit = tokio::select! {
+            r = wait => Some(r?.exit_status),
+            () = tokio::time::sleep(COMMAND_TIMEOUT) => None,
+            () = self.cancel.cancelled() => None,
+        };
+        if exit.is_none() {
+            let _ = self.connection.send_request(KillTerminalRequest::new(sid.clone(), terminal_id.clone())).block_task().await;
+        }
+        let output = self
+            .connection
+            .send_request(TerminalOutputRequest::new(sid.clone(), terminal_id.clone()))
+            .block_task()
+            .await?;
+        let _ = self.connection.send_request(ReleaseTerminalRequest::new(sid, terminal_id)).block_task().await;
+
+        let status = match &exit {
+            Some(s) => match (s.exit_code, &s.signal) {
+                (Some(c), _) => format!("exit code {c}"),
+                (None, Some(sig)) => format!("killed by {sig}"),
+                _ => "exited".into(),
+            },
+            None if self.cancel.is_cancelled() => "cancelled".into(),
+            None => format!("timed out after {}s", COMMAND_TIMEOUT.as_secs()),
+        };
+        let failed = !matches!(exit.as_ref().and_then(|s| s.exit_code), Some(0));
+        let trunc = if output.truncated { "\n[output truncated]" } else { "" };
+        Ok(ToolOutcome { text: format!("{}{trunc}\n[{status}]", output.output), content, failed })
+    }
+
+    async fn run_locally(&self, command: &str) -> Result<ToolOutcome> {
+        let child = tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg(command)
+            .current_dir(&self.cwd)
+            .stdin(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .output();
+        let out = tokio::select! {
+            r = tokio::time::timeout(COMMAND_TIMEOUT, child) => match r {
+                Ok(r) => r?,
+                Err(_) => return Ok(ToolOutcome::err(format!("Command timed out after {}s", COMMAND_TIMEOUT.as_secs()))),
+            },
+            () = self.cancel.cancelled() => return Ok(ToolOutcome::err("Command cancelled")),
+        };
+        let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+        text.push_str(&String::from_utf8_lossy(&out.stderr));
+        let status = out.status.code().map_or_else(|| "killed by signal".into(), |c| format!("exit code {c}"));
+        let text = format!("{}\n[{status}]", truncate(text));
+        let mut outcome = ToolOutcome::ok(format!("```\n{text}\n```"));
+        outcome.text = text;
+        outcome.failed = !out.status.success();
+        Ok(outcome)
+    }
+
+    /// Ask the user for permission. Returns `Ok(false)` if rejected or cancelled.
+    async fn permit(&self, id: &str, tool: &str, content: Vec<ToolCallContent>) -> Result<bool> {
+        if self.yolo || self.always_allowed.lock().unwrap().contains(tool) {
+            return Ok(true);
+        }
+        let mut fields = ToolCallUpdateFields::new();
+        if !content.is_empty() {
+            fields = fields.content(content);
+        }
+        let req = RequestPermissionRequest::new(
+            self.session_id.clone(),
+            ToolCallUpdate::new(id.to_string(), fields),
+            vec![
+                PermissionOption::new("allow_once", "Allow", PermissionOptionKind::AllowOnce),
+                PermissionOption::new("allow_always", "Always allow", PermissionOptionKind::AllowAlways),
+                PermissionOption::new("reject_once", "Reject", PermissionOptionKind::RejectOnce),
+            ],
+        );
+        let resp = tokio::select! {
+            r = self.connection.send_request(req).block_task() => r?,
+            () = self.cancel.cancelled() => return Ok(false),
+        };
+        Ok(match resp.outcome {
+            RequestPermissionOutcome::Selected(sel) => match &*sel.option_id.0 {
+                "allow_always" => {
+                    self.always_allowed.lock().unwrap().insert(tool.to_string());
+                    true
+                }
+                "allow_once" => true,
+                _ => false,
+            },
+            _ => false,
+        })
+    }
+
+    pub fn update(&self, id: &str, fields: ToolCallUpdateFields) -> Result<()> {
+        let update = SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(id.to_string(), fields));
+        self.connection.send_notification(SessionNotification::new(self.session_id.clone(), update))?;
+        Ok(())
+    }
+}
+
+fn truncate(mut s: String) -> String {
+    if s.len() > MAX_OUTPUT_BYTES {
+        let mut cut = MAX_OUTPUT_BYTES;
+        while !s.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        s.truncate(cut);
+        s.push_str("\n[truncated]");
+    }
+    s
+}
