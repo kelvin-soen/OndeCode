@@ -1,0 +1,43 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: aarch64-apple-darwin, os: macos-latest, name: darwin-arm64 }
+          - { target: x86_64-apple-darwin, os: macos-15-intel, name: darwin-x64 }
+          - { target: x86_64-unknown-linux-gnu, os: ubuntu-latest, name: linux-x64 }
+          - { target: aarch64-unknown-linux-gnu, os: ubuntu-24.04-arm, name: linux-arm64 }
+          - { target: x86_64-pc-windows-msvc, os: windows-latest, name: windows-x64 }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Package archive
+        shell: bash
+        run: |
+          BIN=target/${{ matrix.target }}/release/onde-code
+          ARCHIVE=onde-code-${{ matrix.name }}
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then
+            7z a "$ARCHIVE.zip" "$BIN.exe"
+            echo "asset=$ARCHIVE.zip" >> "$GITHUB_ENV"
+          else
+            tar -czf "$ARCHIVE.tar.gz" -C "target/${{ matrix.target }}/release" onde-code
+            echo "asset=$ARCHIVE.tar.gz" >> "$GITHUB_ENV"
+          fi
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.asset }}
+          generate_release_notes: true

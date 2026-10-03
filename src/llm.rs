@@ -75,15 +75,18 @@ impl LlmConfig {
     /// `OPENAI_API_KEY` and `OPENAI_MODEL` override the provider's defaults.
     ///
     /// If none of the provider keys are present in the environment, fallback values are
-    /// loaded from `~/.config/ondecode/env`.
+    /// loaded from `config_dir()/env` (see [`config_dir`]).
     pub fn from_env() -> Self {
         let file_vars = load_config_env_vars();
         Self::from_lookup(|name| {
-            std::env::var(name).ok().or_else(|| file_vars.get(name).cloned())
+            std::env::var(name)
+                .ok()
+                .or_else(|| file_vars.get(name).cloned())
         })
     }
 
-    fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Self {
+    /// Build a config from an arbitrary variable lookup (tests, setup).
+    pub fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Self {
         let env = |name: &str| lookup(name).filter(|v| !v.is_empty());
         let provider = match env("ONDE_CODE_PROVIDER") {
             Some(name) => Provider::parse(&name).unwrap_or_else(|| {
@@ -109,6 +112,34 @@ impl LlmConfig {
     }
 }
 
+/// Platform-appropriate directory for `env` with the stored provider key:
+/// `~/.config/ondecode` on Linux, `~/Library/Application Support/ondecode` on macOS,
+/// `%APPDATA%\ondecode` on Windows. `None` when the user has no config/home directory.
+pub fn config_dir() -> Option<std::path::PathBuf> {
+    directories::BaseDirs::new().map(|dirs| {
+        #[cfg(target_os = "linux")]
+        let base = dirs.config_dir();
+        #[cfg(not(target_os = "linux"))]
+        let base = dirs.data_dir();
+        base.join("ondecode")
+    })
+}
+
+/// Where to look for the stored `env` file, most preferred first: the platform config dir,
+/// then the legacy `~/.config/ondecode/env` used on macOS before platform dirs were adopted.
+fn config_file_candidates() -> Vec<std::path::PathBuf> {
+    let mut paths: Vec<std::path::PathBuf> =
+        config_dir().into_iter().map(|d| d.join("env")).collect();
+    #[cfg(not(target_os = "windows"))]
+    if let Some(home) = directories::BaseDirs::new().map(|d| d.home_dir().to_path_buf()) {
+        let legacy = home.join(".config/ondecode/env");
+        if !paths.contains(&legacy) {
+            paths.push(legacy);
+        }
+    }
+    paths
+}
+
 fn load_config_env_vars() -> std::collections::HashMap<String, String> {
     // If the process environment already provides any LLM credentials/provider,
     // prefer the environment directly without falling back to the config file.
@@ -116,9 +147,7 @@ fn load_config_env_vars() -> std::collections::HashMap<String, String> {
     // Empty strings don't count — GUI launchers (e.g. Zed via launchd) often
     // export variables set to "", and treating those as "present" would skip
     // the config file and silently fall back to OpenAI defaults.
-    let env_nonempty = |name: &str| {
-        std::env::var(name).map(|v| !v.is_empty()).unwrap_or(false)
-    };
+    let env_nonempty = |name: &str| std::env::var(name).map(|v| !v.is_empty()).unwrap_or(false);
     let has_env_config = env_nonempty("ONDE_CODE_PROVIDER")
         || env_nonempty("ONDE_API_KEY")
         || env_nonempty("CONDENSE_API_KEY")
@@ -129,14 +158,11 @@ fn load_config_env_vars() -> std::collections::HashMap<String, String> {
         return vars;
     }
 
-    let home = match std::env::var("HOME") {
-        Ok(h) if !h.is_empty() => std::path::PathBuf::from(h),
-        _ => return vars,
-    };
-    let path = home.join(".config/ondecode/env");
-    let content = match std::fs::read_to_string(&path) {
-        Ok(c) => c,
-        Err(_) => return vars,
+    let content = config_file_candidates()
+        .iter()
+        .find_map(|p| std::fs::read_to_string(p).ok());
+    let Some(content) = content else {
+        return vars;
     };
 
     for line in content.lines() {
@@ -362,6 +388,49 @@ impl LlmClient {
         &self.config.model
     }
 
+    /// Whether an API key is configured for the selected provider.
+    pub fn has_api_key(&self) -> bool {
+        self.config.api_key.is_some()
+    }
+
+    /// Verify the configured key against the provider with a minimal chat completion.
+    /// Returns `Err` when no key is set, the key is rejected, or the endpoint is unreachable.
+    pub async fn check_auth(&self) -> Result<()> {
+        let Some(key) = &self.config.api_key else {
+            bail!(
+                "no API key configured for provider '{}'",
+                self.config.provider.name()
+            );
+        };
+        let body = json!({
+            "model": self.config.model,
+            "messages": [{ "role": "user", "content": "ping" }],
+            "max_tokens": 1,
+            "stream": false,
+        });
+        let mut req = self
+            .http
+            .post(format!("{}/chat/completions", self.config.base_url))
+            .json(&body)
+            .bearer_auth(key);
+        if let Some(condense) = &self.config.condense_key {
+            req = req.header("X-Condense-Auth-Token", condense);
+        }
+        let resp = req.send().await.context("reaching the provider")?;
+        let status = resp.status();
+        if matches!(status.as_u16(), 401 | 403) {
+            bail!(
+                "provider '{}' rejected the API key ({status})",
+                self.config.provider.name()
+            );
+        }
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            bail!("provider returned {status}: {text}");
+        }
+        Ok(())
+    }
+
     /// List the models the configured endpoint serves (`GET {base_url}/models`).
     pub async fn models(&self) -> Result<Vec<ModelInfo>> {
         let url = format!("{}/models", self.config.base_url);
@@ -405,7 +474,7 @@ impl LlmClient {
     ) -> Result<Completion> {
         if self.config.api_key.is_none() {
             bail!(
-                "No API key configured for provider '{}'. Please set {} in your environment or ~/.config/ondecode/env",
+                "No API key configured for provider '{}'. Please set {} in your environment or run `onde-code --setup`",
                 self.config.provider.name(),
                 self.config.provider.key_var()
             );

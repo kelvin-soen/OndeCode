@@ -13,17 +13,21 @@ use std::io::IsTerminal;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use agent_client_protocol::schema::v1::{
-    AgentCapabilities, CancelNotification, ClientCapabilities, ContentBlock, ContentChunk,
-    EmbeddedResourceResource, Implementation, InitializeRequest, InitializeResponse,
-    NewSessionRequest, NewSessionResponse, PromptCapabilities, PromptRequest, PromptResponse,
-    SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOption,
-    SessionConfigSelectOptions, SessionId, SessionNotification, SessionUpdate,
+    AgentCapabilities, AuthMethod, AuthMethodTerminal, CancelNotification, ClientCapabilities,
+    ContentBlock, ContentChunk, EmbeddedResourceResource, Implementation, InitializeRequest,
+    InitializeResponse, ListSessionsRequest, ListSessionsResponse, NewSessionRequest,
+    NewSessionResponse, PromptCapabilities, PromptRequest, PromptResponse,
+    SessionAdditionalDirectoriesCapabilities, SessionCapabilities, SessionConfigOption,
+    SessionConfigOptionCategory, SessionConfigSelectOption, SessionConfigSelectOptions, SessionId,
+    SessionInfo, SessionListCapabilities, SessionNotification, SessionUpdate,
     SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, StopReason, ToolCall,
     ToolCallStatus, ToolCallUpdateFields,
 };
 use agent_client_protocol::{Agent, Client, ConnectionTo, Responder, Stdio};
+use anyhow::Context;
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
@@ -34,6 +38,20 @@ const MAX_TURNS: usize = 50;
 /// Id of the session config option that selects the model.
 const MODEL_CONFIG_ID: &str = "model";
 
+/// The terminal auth method advertised on initialize: clients run `onde-code --setup`.
+fn auth_methods() -> Vec<AuthMethod> {
+    vec![AuthMethod::Terminal(
+        AuthMethodTerminal::new("terminal-setup", "Run in terminal")
+            .description("Interactive setup: choose a provider and store an API key")
+            .args(vec!["--setup".into()]),
+    )]
+}
+
+fn auth_required_error() -> agent_client_protocol::Error {
+    agent_client_protocol::Error::auth_required()
+        .data("No API key configured. Authenticate with the terminal method (`onde-code --setup`).")
+}
+
 struct Session {
     cwd: PathBuf,
     /// Additional workspace roots (from `NewSessionRequest::additional_directories`).
@@ -42,6 +60,41 @@ struct Session {
     messages: Vec<Value>,
     cancel: CancellationToken,
     always_allowed: Arc<Mutex<HashSet<String>>>,
+    /// Human-readable title shown by `session/list`: the first user prompt.
+    title: Option<String>,
+    /// Last activity, seconds since the Unix epoch (reported by `session/list`).
+    updated_at: u64,
+}
+
+/// Seconds since the Unix epoch, for `SessionInfo::updated_at`.
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// ISO 8601 UTC timestamp without sub-second precision (no chrono dependency).
+fn iso8601(secs: u64) -> String {
+    let days = secs / 86_400;
+    let secs_of_day = secs % 86_400;
+    let (h, m, s) = (
+        secs_of_day / 3600,
+        secs_of_day % 3600 / 60,
+        secs_of_day % 60,
+    );
+    // Civil-from-days algorithm (Howard Hinnant).
+    let z = days as i64 + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let mo = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if mo <= 2 { y + 1 } else { y };
+    format!("{y:04}-{mo:02}-{d:02}T{h:02}:{m:02}:{s:02}Z")
 }
 
 #[derive(Clone)]
@@ -178,9 +231,31 @@ impl CoderAgent {
             roots,
             cancel: CancellationToken::new(),
             always_allowed: Arc::default(),
+            title: None,
+            updated_at: now_secs(),
         };
         self.sessions.lock().unwrap().insert(id.clone(), session);
         NewSessionResponse::new(id).config_options(options)
+    }
+
+    /// List live sessions, optionally filtered by working directory. Sessions are kept in
+    /// memory only, so only sessions created by this process show up, most recent first.
+    fn list_sessions(&self, req: ListSessionsRequest) -> ListSessionsResponse {
+        let sessions = self.sessions.lock().unwrap();
+        // Sort on the raw epoch seconds; the ISO 8601 string is only for display.
+        let mut entries: Vec<(u64, SessionInfo)> = sessions
+            .iter()
+            .filter(|(_, s)| req.cwd.as_ref().is_none_or(|cwd| *cwd == s.cwd))
+            .map(|(id, s)| {
+                let info = SessionInfo::new(id.clone(), s.cwd.clone())
+                    .additional_directories(s.roots.clone())
+                    .title(s.title.clone())
+                    .updated_at(iso8601(s.updated_at));
+                (s.updated_at, info)
+            })
+            .collect();
+        entries.sort_by_key(|(updated, _)| std::cmp::Reverse(*updated));
+        ListSessionsResponse::new(entries.into_iter().map(|(_, info)| info).collect())
     }
 
     fn cancel(&self, session_id: &SessionId) {
@@ -209,6 +284,7 @@ impl CoderAgent {
         connection: ConnectionTo<Client>,
     ) -> anyhow::Result<StopReason> {
         let session_id = request.session_id.clone();
+        let prompt_text = prompt_to_text(&request.prompt);
         // Take the history out while the turn runs; it's put back at the end.
         let (cwd, roots, model, mut messages, cancel, always_allowed) = {
             let mut sessions = self.sessions.lock().unwrap();
@@ -216,6 +292,10 @@ impl CoderAgent {
                 .get_mut(&session_id)
                 .ok_or_else(|| anyhow::anyhow!("unknown session {session_id}"))?;
             s.cancel = CancellationToken::new();
+            s.updated_at = now_secs();
+            if s.title.is_none() {
+                s.title = Some(session_title(&prompt_text));
+            }
             (
                 s.cwd.clone(),
                 s.roots.clone(),
@@ -225,7 +305,7 @@ impl CoderAgent {
                 s.always_allowed.clone(),
             )
         };
-        messages.push(json!({ "role": "user", "content": prompt_to_text(&request.prompt) }));
+        messages.push(json!({ "role": "user", "content": prompt_text }));
 
         let ctx = ToolCtx {
             connection: connection.clone(),
@@ -241,6 +321,7 @@ impl CoderAgent {
 
         if let Some(s) = self.sessions.lock().unwrap().get_mut(&session_id) {
             s.messages = messages;
+            s.updated_at = now_secs();
         }
         result
     }
@@ -326,6 +407,18 @@ fn tool_message(id: &str, content: &str) -> Value {
     json!({ "role": "tool", "tool_call_id": id, "content": content })
 }
 
+/// Derive a short session title from the first user prompt.
+fn session_title(prompt: &str) -> String {
+    const MAX: usize = 80;
+    let first = prompt.lines().next().unwrap_or("").trim();
+    if first.chars().count() <= MAX {
+        first.to_string()
+    } else {
+        let cut: String = first.chars().take(MAX - 1).collect();
+        format!("{}…", cut.trim_end())
+    }
+}
+
 /// Flatten ACP prompt content into text for the model.
 fn prompt_to_text(blocks: &[ContentBlock]) -> String {
     let mut parts = Vec::new();
@@ -345,13 +438,14 @@ fn prompt_to_text(blocks: &[ContentBlock]) -> String {
 }
 
 const USAGE: &str = "\
-Usage: onde-code [--acp] [--yolo] [--list-models] [--root <path>...]
+Usage: onde-code [--acp] [--yolo] [--list-models] [--root <path>...] [--setup]
 
   (no args)      interactive terminal UI (when run from a terminal)
   --acp          speak ACP over stdio for an editor (default when stdin is not a terminal)
   --yolo         approve file edits and commands without asking
   --list-models  list the models the configured endpoint serves, then exit
   --root <path>  add an extra workspace root (repeatable; TUI mode only)
+  --setup        interactive first-run setup: choose a provider and store an API key
 ";
 
 #[tokio::main]
@@ -383,12 +477,14 @@ async fn main() -> anyhow::Result<()> {
                 }
                 roots.push(path);
             }
-            "--acp" | "--yolo" | "--list-models" => {}
+            "--acp" | "--yolo" | "--list-models" | "--setup" => {}
             bad => anyhow::bail!("unknown argument {bad}\n\n{USAGE}"),
         }
         i += 1;
     }
-    if has("--list-models") {
+    if has("--setup") {
+        setup().await?;
+    } else if has("--list-models") {
         list_models().await?;
     } else if has("--acp") || !std::io::stdin().is_terminal() {
         if !roots.is_empty() {
@@ -398,6 +494,82 @@ async fn main() -> anyhow::Result<()> {
     } else {
         tui::run(has("--yolo"), roots).await?;
     }
+    Ok(())
+}
+
+/// Interactive first-run setup (`--setup`): pick a provider, prompt for its API key, verify it
+/// against the provider, and store it in the platform config dir (`config_dir()/env`, mode 0600).
+async fn setup() -> anyhow::Result<()> {
+    use std::io::Write;
+
+    if !std::io::stdin().is_terminal() {
+        anyhow::bail!("--setup needs an interactive terminal");
+    }
+    let prompt_line = |label: &str| -> anyhow::Result<String> {
+        print!("{label}");
+        std::io::stdout().flush()?;
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line)?;
+        Ok(line.trim().to_string())
+    };
+
+    println!("onde-code setup\n");
+    println!("  1) Onde Cloud (ONDE_API_KEY, https://cloud.ondeinference.com)");
+    println!("  2) Condense   (CONDENSE_API_KEY, https://api.condense.chat)");
+    println!("  3) OpenAI     (OPENAI_API_KEY, https://api.openai.com)");
+    let (provider_var, key_var) = loop {
+        match prompt_line("\nChoose a provider [1-3]: ")?.as_str() {
+            "1" | "onde" => break ("onde", "ONDE_API_KEY"),
+            "2" | "condense" => break ("condense", "CONDENSE_API_KEY"),
+            "3" | "openai" => break ("openai", "OPENAI_API_KEY"),
+            _ => println!("Please enter 1, 2 or 3."),
+        }
+    };
+    if provider_var == "onde" {
+        // Same auth as documented at https://ondeinference.com/cloud.
+        println!("\nGet credentials: sign in at https://ondeinference.com/root/login,");
+        println!("register an app and assign a model. Your key is \"app-id:app-secret\".");
+    }
+    let key = loop {
+        let key = prompt_line(&format!("Paste your {key_var}: "))?;
+        if key.is_empty() {
+            println!("Key must not be empty.");
+        } else if provider_var == "onde" && key.split(':').count() != 2 {
+            println!("Onde credentials look like \"app-id:app-secret\" (one colon).");
+        } else {
+            break key;
+        }
+    };
+
+    // Verify against the provider before writing anything.
+    let config = LlmConfig::from_lookup(|name| {
+        if name == "ONDE_CODE_PROVIDER" {
+            Some(provider_var.to_string())
+        } else if name == key_var {
+            Some(key.clone())
+        } else {
+            std::env::var(name).ok()
+        }
+    });
+    let client = LlmClient::new(config);
+    print!("Verifying the key with {}… ", provider_var);
+    std::io::stdout().flush()?;
+    match client.check_auth().await {
+        Ok(()) => println!("OK"),
+        Err(e) => anyhow::bail!("\nKey check failed: {e:#}\nNothing was written."),
+    }
+
+    let dir = llm::config_dir().context("no config directory available")?;
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join("env");
+    let content = format!("ONDE_CODE_PROVIDER={provider_var}\n{key_var}={key}\n");
+    std::fs::write(&path, content)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    println!("\nWrote {} — you're all set.", path.display());
     Ok(())
 }
 
@@ -438,9 +610,20 @@ async fn run_agent(yolo_flag: bool) -> agent_client_protocol::Result<()> {
                     *agent.client_caps.lock().unwrap() = req.client_capabilities.clone();
                     responder.respond(
                         InitializeResponse::new(req.protocol_version)
-                            .agent_capabilities(AgentCapabilities::new().prompt_capabilities(
-                                PromptCapabilities::new().embedded_context(true),
-                            ))
+                            .auth_methods(auth_methods())
+                            .agent_capabilities(
+                                AgentCapabilities::new()
+                                    .prompt_capabilities(
+                                        PromptCapabilities::new().embedded_context(true),
+                                    )
+                                    .session_capabilities(
+                                        SessionCapabilities::new()
+                                            .list(SessionListCapabilities::new())
+                                            .additional_directories(
+                                                SessionAdditionalDirectoriesCapabilities::new(),
+                                            ),
+                                    ),
+                            )
                             .agent_info(Implementation::new(
                                 "onde-code",
                                 env!("CARGO_PKG_VERSION"),
@@ -457,9 +640,21 @@ async fn run_agent(yolo_flag: bool) -> agent_client_protocol::Result<()> {
                     // Listing models is a network call; keep it off the dispatch loop.
                     let agent = agent.clone();
                     cx.spawn(async move {
+                        if !agent.llm.has_api_key() {
+                            return responder.respond_with_error(auth_required_error());
+                        }
                         responder
                             .respond(agent.new_session(req.cwd, req.additional_directories).await)
                     })
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let agent = agent.clone();
+                async move |req: ListSessionsRequest, responder, _cx| {
+                    responder.respond(agent.list_sessions(req))
                 }
             },
             agent_client_protocol::on_receive_request!(),
@@ -486,7 +681,12 @@ async fn run_agent(yolo_flag: bool) -> agent_client_protocol::Result<()> {
                     // Run the turn off the dispatch loop so it can make requests to the client.
                     let agent = agent.clone();
                     let connection = cx.clone();
-                    cx.spawn(async move { agent.prompt(req, responder, connection).await })
+                    cx.spawn(async move {
+                        if !agent.llm.has_api_key() {
+                            return responder.respond_with_error(auth_required_error());
+                        }
+                        agent.prompt(req, responder, connection).await
+                    })
                 }
             },
             agent_client_protocol::on_receive_request!(),
