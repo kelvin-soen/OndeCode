@@ -285,6 +285,7 @@ impl CoderAgent {
     ) -> anyhow::Result<StopReason> {
         let session_id = request.session_id.clone();
         let prompt_text = prompt_to_text(&request.prompt);
+        let prompt_content = prompt_to_content(&request.prompt);
         // Take the history out while the turn runs; it's put back at the end.
         let (cwd, roots, model, mut messages, cancel, always_allowed) = {
             let mut sessions = self.sessions.lock().unwrap();
@@ -305,7 +306,7 @@ impl CoderAgent {
                 s.always_allowed.clone(),
             )
         };
-        messages.push(json!({ "role": "user", "content": prompt_text }));
+        messages.push(json!({ "role": "user", "content": prompt_content }));
 
         let ctx = ToolCtx {
             connection: connection.clone(),
@@ -435,6 +436,38 @@ fn prompt_to_text(blocks: &[ContentBlock]) -> String {
         }
     }
     parts.join("\n\n")
+}
+
+/// Convert ACP prompt content blocks into an OpenAI-compatible `content` value.
+///
+/// Returns a plain string when only text is present (backward compatible), or an
+/// array of content parts when images are included (OpenAI vision format):
+/// `[{"type":"text","text":"..."},{"type":"image_url","image_url":{"url":"data:mime;base64,..."}}]`
+fn prompt_to_content(blocks: &[ContentBlock]) -> Value {
+    let has_image = blocks.iter().any(|b| matches!(b, ContentBlock::Image(_)));
+    if !has_image {
+        return json!(prompt_to_text(blocks));
+    }
+    let mut parts: Vec<Value> = Vec::new();
+    for block in blocks {
+        match block {
+            ContentBlock::Text(t) => parts.push(json!({ "type": "text", "text": t.text })),
+            ContentBlock::ResourceLink(link) => {
+                parts.push(json!({ "type": "text", "text": format!("[Referenced: {}]", link.uri) }));
+            }
+            ContentBlock::Resource(res) => {
+                if let EmbeddedResourceResource::TextResourceContents(r) = &res.resource {
+                    parts.push(json!({ "type": "text", "text": format!("<file uri=\"{}\">\n{}\n</file>", r.uri, r.text) }));
+                }
+            }
+            ContentBlock::Image(img) => {
+                let data_url = format!("data:{};base64,{}", img.mime_type, img.data);
+                parts.push(json!({ "type": "image_url", "image_url": { "url": data_url } }));
+            }
+            _ => {}
+        }
+    }
+    json!(parts)
 }
 
 const USAGE: &str = "\
@@ -614,7 +647,9 @@ async fn run_agent(yolo_flag: bool) -> agent_client_protocol::Result<()> {
                             .agent_capabilities(
                                 AgentCapabilities::new()
                                     .prompt_capabilities(
-                                        PromptCapabilities::new().embedded_context(true),
+                                        PromptCapabilities::new()
+                                            .embedded_context(true)
+                                            .image(true),
                                     )
                                     .session_capabilities(
                                         SessionCapabilities::new()
