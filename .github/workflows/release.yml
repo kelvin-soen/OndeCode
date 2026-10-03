@@ -43,5 +43,8 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           # Create the release once (first matrix job wins; others no-op).
-          gh release create "$GITHUB_REF_NAME" --verify-tag --generate-notes || true
+          # Tolerate only the already-exists race: a genuinely failed create
+          # makes `gh release view` fail too, so the step still fails loudly.
+          gh release create "$GITHUB_REF_NAME" --verify-tag --generate-notes \
+            || gh release view "$GITHUB_REF_NAME" >/dev/null
           gh release upload "$GITHUB_REF_NAME" "$asset" --clobber
