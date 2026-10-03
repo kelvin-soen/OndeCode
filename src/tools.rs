@@ -70,7 +70,7 @@ pub fn definitions() -> Value {
     let root_prop = || {
         json!({
             "type": "string",
-            "description": "Workspace root to act in: absolute path of one of the session roots. Defaults to the primary working directory."
+            "description": "Workspace root to act in: absolute path of a session root or a directory beneath one. Defaults to the primary working directory."
         })
     };
     json!([
@@ -221,8 +221,9 @@ impl ToolCtx {
             .collect()
     }
 
-    /// The base directory for a tool call's `root` parameter: an exact workspace root or a
-    /// direct child of one (so the model can pass e.g. a crate dir inside a root).
+    /// The base directory for a tool call's `root` parameter: a workspace root or any
+    /// directory beneath one (so the model can pass e.g. `root/crate/src`). Paths that
+    /// escape a root via `..` are rejected.
     fn base_for(&self, root: Option<&str>) -> Result<PathBuf> {
         let Some(root) = root else {
             return Ok(self.cwd.clone());
@@ -232,11 +233,10 @@ impl ToolCtx {
             if candidate == ws_root {
                 return Ok(ws_root);
             }
+            // Allow any directory below a root (e.g. a crate dir like `root/crate/src`),
+            // as long as it doesn't escape the root via `..`.
             if let Ok(rest) = candidate.strip_prefix(&ws_root) {
-                // Allow exactly one directory level below a root.
-                if rest.components().count() == 1
-                    && matches!(rest.components().next(), Some(Component::Normal(_)))
-                {
+                if rest.components().all(|c| matches!(c, Component::Normal(_))) {
                     return Ok(candidate);
                 }
             }
