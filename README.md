@@ -15,6 +15,10 @@ llama.cpp, LM Studio, …) with streaming and function calling.
 - Uses the client's `fs/*` and `terminal/*` methods when advertised, otherwise the local
   filesystem and `sh -c`
 - Supports `session/cancel` and keeps conversation history per session
+- Multi-root workspaces (`additionalDirectories`): every tool takes an optional `root`
+- `session/list` with titles, roots and last-activity timestamps
+- Terminal authentication: `--setup` stores a provider key in `~/.config/ondecode/env`;
+  unauthenticated requests get `AUTH_REQUIRED`
 
 ## Build
 
@@ -23,6 +27,11 @@ cargo build --release   # -> target/release/onde-code
 ```
 
 ## Configuration
+
+Run `onde-code --setup` for an interactive first-run flow: pick a provider, paste its key
+(verified live against the provider), and it's stored in `~/.config/ondecode/env`. Editors that
+speak ACP offer this as the authentication method; when no key is configured the agent answers
+`session/new` and `session/prompt` with `AUTH_REQUIRED`.
 
 ### Providers
 

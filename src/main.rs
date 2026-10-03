@@ -524,10 +524,17 @@ async fn setup() -> anyhow::Result<()> {
             _ => println!("Please enter 1, 2 or 3."),
         }
     };
+    if provider_var == "onde" {
+        // Same auth as documented at https://ondeinference.com/cloud.
+        println!("\nGet credentials: sign in at https://ondeinference.com/root/login,");
+        println!("register an app and assign a model. Your key is \"app-id:app-secret\".");
+    }
     let key = loop {
         let key = prompt_line(&format!("Paste your {key_var}: "))?;
         if key.is_empty() {
             println!("Key must not be empty.");
+        } else if provider_var == "onde" && key.split(':').count() != 2 {
+            println!("Onde credentials look like \"app-id:app-secret\" (one colon).");
         } else {
             break key;
         }
