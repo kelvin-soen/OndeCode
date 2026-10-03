@@ -100,3 +100,7 @@ Editors launch the agent with piped stdio, which selects ACP mode automatically 
 - `src/llm.rs` – streaming SSE client for chat completions, accumulates tool-call deltas
 - `src/tools.rs` – tool schemas and execution, permission flow, client fs/terminal routing
 - `src/tui.rs` – ratatui terminal UI; an ACP client that spawns the agent as a subprocess
+
+## License
+
+This project is licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE) for details.
