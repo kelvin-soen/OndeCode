@@ -37,7 +37,11 @@ jobs:
             tar -czf "$ARCHIVE.tar.gz" -C "target/${{ matrix.target }}/release" onde-code
             echo "asset=$ARCHIVE.tar.gz" >> "$GITHUB_ENV"
           fi
-      - uses: softprops/action-gh-release@v2
-        with:
-          files: ${{ env.asset }}
-          generate_release_notes: true
+      - name: Upload release asset
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Create the release once (first matrix job wins; others no-op).
+          gh release create "$GITHUB_REF_NAME" --verify-tag --generate-notes || true
+          gh release upload "$GITHUB_REF_NAME" "$asset" --clobber
