@@ -26,9 +26,10 @@ cargo build --release   # -> target/release/acp-coder
 
 | Env var            | Default                     |                                    |
 |--------------------|-----------------------------|------------------------------------|
-| `OPENAI_BASE_URL`  | `https://api.openai.com/v1` | any OpenAI-compatible base URL     |
+| `OPENAI_BASE_URL`  | `https://api.openai.com/v1` | any OpenAI-compatible base URL (defaults to `https://api.condense.chat/openai/v1` when `CONDENSE_API_KEY` is set) |
 | `OPENAI_API_KEY`   | (none)                      | sent as a Bearer token if set      |
 | `OPENAI_MODEL`     | `gpt-4o-mini`               | must support tool/function calling |
+| `CONDENSE_API_KEY` | unset                       | [condense.chat](https://condense.chat) key, sent as `X-Condense-Auth-Token` with the ACP session id as `X-Condense-Session-Id`; `OPENAI_API_KEY` is still the upstream provider key |
 | `ACP_CODER_YOLO`   | unset                       | `1` skips permission prompts       |
 | `RUST_LOG`         | unset                       | logs go to stderr                  |
 

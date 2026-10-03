@@ -128,7 +128,7 @@ impl CoderAgent {
 
         for _ in 0..MAX_TURNS {
             let completion = tokio::select! {
-                r = self.llm.complete(messages, &tool_defs, |delta| {
+                r = self.llm.complete(&ctx.session_id.0, messages, &tool_defs, |delta| {
                     let update = match delta {
                         Delta::Text(t) => SessionUpdate::AgentMessageChunk(ContentChunk::new(t.to_string().into())),
                         Delta::Reasoning(t) => SessionUpdate::AgentThoughtChunk(ContentChunk::new(t.to_string().into())),

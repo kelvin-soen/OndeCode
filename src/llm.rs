@@ -10,17 +10,26 @@ pub struct LlmConfig {
     pub base_url: String,
     pub api_key: Option<String>,
     pub model: String,
+    /// condense.chat key, sent as `X-Condense-Auth-Token` (the upstream key stays in `api_key`).
+    pub condense_key: Option<String>,
 }
 
 impl LlmConfig {
     pub fn from_env() -> Self {
+        let condense_key = std::env::var("CONDENSE_API_KEY").ok().filter(|k| !k.is_empty());
+        let default_base = if condense_key.is_some() {
+            "https://api.condense.chat/openai/v1"
+        } else {
+            "https://api.openai.com/v1"
+        };
         Self {
             base_url: std::env::var("OPENAI_BASE_URL")
-                .unwrap_or_else(|_| "https://api.openai.com/v1".into())
+                .unwrap_or_else(|_| default_base.into())
                 .trim_end_matches('/')
                 .to_string(),
             api_key: std::env::var("OPENAI_API_KEY").ok().filter(|k| !k.is_empty()),
             model: std::env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4o-mini".into()),
+            condense_key,
         }
     }
 }
@@ -121,6 +130,7 @@ impl LlmClient {
     /// Run one streaming chat completion, invoking `on_delta` for every text fragment.
     pub async fn complete(
         &self,
+        session_id: &str,
         messages: &[Value],
         tools: &Value,
         mut on_delta: impl FnMut(Delta<'_>),
@@ -137,6 +147,11 @@ impl LlmClient {
             .json(&body);
         if let Some(key) = &self.config.api_key {
             req = req.bearer_auth(key);
+        }
+        if let Some(key) = &self.config.condense_key {
+            req = req
+                .header("X-Condense-Auth-Token", key)
+                .header("X-Condense-Session-Id", session_id);
         }
         let resp = req.send().await.context("sending chat completion request")?;
         if !resp.status().is_success() {
