@@ -13,15 +13,17 @@ use std::io::IsTerminal;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use agent_client_protocol::schema::v1::{
     AgentCapabilities, CancelNotification, ClientCapabilities, ContentBlock, ContentChunk,
     EmbeddedResourceResource, Implementation, InitializeRequest, InitializeResponse,
-    NewSessionRequest, NewSessionResponse, PromptCapabilities, PromptRequest, PromptResponse,
-    SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOption,
-    SessionConfigSelectOptions, SessionId, SessionNotification, SessionUpdate,
-    SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, StopReason, ToolCall,
-    ToolCallStatus, ToolCallUpdateFields,
+    ListSessionsRequest, ListSessionsResponse, NewSessionRequest, NewSessionResponse,
+    PromptCapabilities, PromptRequest, PromptResponse, SessionAdditionalDirectoriesCapabilities,
+    SessionCapabilities, SessionConfigOption, SessionConfigOptionCategory,
+    SessionConfigSelectOption, SessionConfigSelectOptions, SessionId, SessionInfo,
+    SessionListCapabilities, SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
+    SetSessionConfigOptionResponse, StopReason, ToolCall, ToolCallStatus, ToolCallUpdateFields,
 };
 use agent_client_protocol::{Agent, Client, ConnectionTo, Responder, Stdio};
 use serde_json::{Value, json};
@@ -42,6 +44,41 @@ struct Session {
     messages: Vec<Value>,
     cancel: CancellationToken,
     always_allowed: Arc<Mutex<HashSet<String>>>,
+    /// Human-readable title shown by `session/list`: the first user prompt.
+    title: Option<String>,
+    /// Last activity, seconds since the Unix epoch (reported by `session/list`).
+    updated_at: u64,
+}
+
+/// Seconds since the Unix epoch, for `SessionInfo::updated_at`.
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// ISO 8601 UTC timestamp without sub-second precision (no chrono dependency).
+fn iso8601(secs: u64) -> String {
+    let days = secs / 86_400;
+    let secs_of_day = secs % 86_400;
+    let (h, m, s) = (
+        secs_of_day / 3600,
+        secs_of_day % 3600 / 60,
+        secs_of_day % 60,
+    );
+    // Civil-from-days algorithm (Howard Hinnant).
+    let z = days as i64 + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let mo = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if mo <= 2 { y + 1 } else { y };
+    format!("{y:04}-{mo:02}-{d:02}T{h:02}:{m:02}:{s:02}Z")
 }
 
 #[derive(Clone)]
@@ -178,9 +215,29 @@ impl CoderAgent {
             roots,
             cancel: CancellationToken::new(),
             always_allowed: Arc::default(),
+            title: None,
+            updated_at: now_secs(),
         };
         self.sessions.lock().unwrap().insert(id.clone(), session);
         NewSessionResponse::new(id).config_options(options)
+    }
+
+    /// List live sessions, optionally filtered by working directory. Sessions are kept in
+    /// memory only, so only sessions created by this process show up, most recent first.
+    fn list_sessions(&self, req: ListSessionsRequest) -> ListSessionsResponse {
+        let sessions = self.sessions.lock().unwrap();
+        let mut infos: Vec<SessionInfo> = sessions
+            .iter()
+            .filter(|(_, s)| req.cwd.as_ref().is_none_or(|cwd| *cwd == s.cwd))
+            .map(|(id, s)| {
+                SessionInfo::new(id.clone(), s.cwd.clone())
+                    .additional_directories(s.roots.clone())
+                    .title(s.title.clone())
+                    .updated_at(iso8601(s.updated_at))
+            })
+            .collect();
+        infos.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        ListSessionsResponse::new(infos)
     }
 
     fn cancel(&self, session_id: &SessionId) {
@@ -209,6 +266,7 @@ impl CoderAgent {
         connection: ConnectionTo<Client>,
     ) -> anyhow::Result<StopReason> {
         let session_id = request.session_id.clone();
+        let prompt_text = prompt_to_text(&request.prompt);
         // Take the history out while the turn runs; it's put back at the end.
         let (cwd, roots, model, mut messages, cancel, always_allowed) = {
             let mut sessions = self.sessions.lock().unwrap();
@@ -216,6 +274,10 @@ impl CoderAgent {
                 .get_mut(&session_id)
                 .ok_or_else(|| anyhow::anyhow!("unknown session {session_id}"))?;
             s.cancel = CancellationToken::new();
+            s.updated_at = now_secs();
+            if s.title.is_none() {
+                s.title = Some(session_title(&prompt_text));
+            }
             (
                 s.cwd.clone(),
                 s.roots.clone(),
@@ -225,7 +287,7 @@ impl CoderAgent {
                 s.always_allowed.clone(),
             )
         };
-        messages.push(json!({ "role": "user", "content": prompt_to_text(&request.prompt) }));
+        messages.push(json!({ "role": "user", "content": prompt_text }));
 
         let ctx = ToolCtx {
             connection: connection.clone(),
@@ -241,6 +303,7 @@ impl CoderAgent {
 
         if let Some(s) = self.sessions.lock().unwrap().get_mut(&session_id) {
             s.messages = messages;
+            s.updated_at = now_secs();
         }
         result
     }
@@ -324,6 +387,18 @@ impl CoderAgent {
 
 fn tool_message(id: &str, content: &str) -> Value {
     json!({ "role": "tool", "tool_call_id": id, "content": content })
+}
+
+/// Derive a short session title from the first user prompt.
+fn session_title(prompt: &str) -> String {
+    const MAX: usize = 80;
+    let first = prompt.lines().next().unwrap_or("").trim();
+    if first.chars().count() <= MAX {
+        first.to_string()
+    } else {
+        let cut: String = first.chars().take(MAX - 1).collect();
+        format!("{}…", cut.trim_end())
+    }
 }
 
 /// Flatten ACP prompt content into text for the model.
@@ -438,9 +513,19 @@ async fn run_agent(yolo_flag: bool) -> agent_client_protocol::Result<()> {
                     *agent.client_caps.lock().unwrap() = req.client_capabilities.clone();
                     responder.respond(
                         InitializeResponse::new(req.protocol_version)
-                            .agent_capabilities(AgentCapabilities::new().prompt_capabilities(
-                                PromptCapabilities::new().embedded_context(true),
-                            ))
+                            .agent_capabilities(
+                                AgentCapabilities::new()
+                                    .prompt_capabilities(
+                                        PromptCapabilities::new().embedded_context(true),
+                                    )
+                                    .session_capabilities(
+                                        SessionCapabilities::new()
+                                            .list(SessionListCapabilities::new())
+                                            .additional_directories(
+                                                SessionAdditionalDirectoriesCapabilities::new(),
+                                            ),
+                                    ),
+                            )
                             .agent_info(Implementation::new(
                                 "onde-code",
                                 env!("CARGO_PKG_VERSION"),
@@ -460,6 +545,15 @@ async fn run_agent(yolo_flag: bool) -> agent_client_protocol::Result<()> {
                         responder
                             .respond(agent.new_session(req.cwd, req.additional_directories).await)
                     })
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let agent = agent.clone();
+                async move |req: ListSessionsRequest, responder, _cx| {
+                    responder.respond(agent.list_sessions(req))
                 }
             },
             agent_client_protocol::on_receive_request!(),
