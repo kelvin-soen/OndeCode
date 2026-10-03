@@ -75,7 +75,7 @@ impl LlmConfig {
     /// `OPENAI_API_KEY` and `OPENAI_MODEL` override the provider's defaults.
     ///
     /// If none of the provider keys are present in the environment, fallback values are
-    /// loaded from `~/.config/ondecode/env`.
+    /// loaded from `config_dir()/env` (see [`config_dir`]).
     pub fn from_env() -> Self {
         let file_vars = load_config_env_vars();
         Self::from_lookup(|name| {
@@ -112,6 +112,34 @@ impl LlmConfig {
     }
 }
 
+/// Platform-appropriate directory for `env` with the stored provider key:
+/// `~/.config/ondecode` on Linux, `~/Library/Application Support/ondecode` on macOS,
+/// `%APPDATA%\ondecode` on Windows. `None` when the user has no config/home directory.
+pub fn config_dir() -> Option<std::path::PathBuf> {
+    directories::BaseDirs::new().map(|dirs| {
+        #[cfg(target_os = "linux")]
+        let base = dirs.config_dir();
+        #[cfg(not(target_os = "linux"))]
+        let base = dirs.data_dir();
+        base.join("ondecode")
+    })
+}
+
+/// Where to look for the stored `env` file, most preferred first: the platform config dir,
+/// then the legacy `~/.config/ondecode/env` used on macOS before platform dirs were adopted.
+fn config_file_candidates() -> Vec<std::path::PathBuf> {
+    let mut paths: Vec<std::path::PathBuf> =
+        config_dir().into_iter().map(|d| d.join("env")).collect();
+    #[cfg(not(target_os = "windows"))]
+    if let Some(home) = directories::BaseDirs::new().map(|d| d.home_dir().to_path_buf()) {
+        let legacy = home.join(".config/ondecode/env");
+        if !paths.contains(&legacy) {
+            paths.push(legacy);
+        }
+    }
+    paths
+}
+
 fn load_config_env_vars() -> std::collections::HashMap<String, String> {
     // If the process environment already provides any LLM credentials/provider,
     // prefer the environment directly without falling back to the config file.
@@ -130,14 +158,11 @@ fn load_config_env_vars() -> std::collections::HashMap<String, String> {
         return vars;
     }
 
-    let home = match std::env::var("HOME") {
-        Ok(h) if !h.is_empty() => std::path::PathBuf::from(h),
-        _ => return vars,
-    };
-    let path = home.join(".config/ondecode/env");
-    let content = match std::fs::read_to_string(&path) {
-        Ok(c) => c,
-        Err(_) => return vars,
+    let content = config_file_candidates()
+        .iter()
+        .find_map(|p| std::fs::read_to_string(p).ok());
+    let Some(content) = content else {
+        return vars;
     };
 
     for line in content.lines() {
@@ -449,7 +474,7 @@ impl LlmClient {
     ) -> Result<Completion> {
         if self.config.api_key.is_none() {
             bail!(
-                "No API key configured for provider '{}'. Please set {} in your environment or ~/.config/ondecode/env",
+                "No API key configured for provider '{}'. Please set {} in your environment or run `onde-code --setup`",
                 self.config.provider.name(),
                 self.config.provider.key_var()
             );

@@ -27,6 +27,7 @@ use agent_client_protocol::schema::v1::{
     ToolCallStatus, ToolCallUpdateFields,
 };
 use agent_client_protocol::{Agent, Client, ConnectionTo, Responder, Stdio};
+use anyhow::Context;
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
@@ -497,7 +498,7 @@ async fn main() -> anyhow::Result<()> {
 }
 
 /// Interactive first-run setup (`--setup`): pick a provider, prompt for its API key, verify it
-/// against the provider, and store it in `~/.config/ondecode/env` (mode 0600).
+/// against the provider, and store it in the platform config dir (`config_dir()/env`, mode 0600).
 async fn setup() -> anyhow::Result<()> {
     use std::io::Write;
 
@@ -558,8 +559,7 @@ async fn setup() -> anyhow::Result<()> {
         Err(e) => anyhow::bail!("\nKey check failed: {e:#}\nNothing was written."),
     }
 
-    let home = std::env::var("HOME").map(PathBuf::from)?;
-    let dir = home.join(".config/ondecode");
+    let dir = llm::config_dir().context("no config directory available")?;
     std::fs::create_dir_all(&dir)?;
     let path = dir.join("env");
     let content = format!("ONDE_CODE_PROVIDER={provider_var}\n{key_var}={key}\n");
