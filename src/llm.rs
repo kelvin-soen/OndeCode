@@ -54,7 +54,7 @@ impl Provider {
         match self {
             Self::OpenAi => "gpt-4o-mini",
             Self::Condense => "google/gemini-3.8-flash",
-            Self::Onde => "onde-air",
+            Self::Onde => "onde-kkk",
         }
     }
 }
@@ -117,7 +117,7 @@ mod tests {
         assert_eq!(c.provider, Provider::Onde);
         assert_eq!(c.base_url, "https://cloud.ondeinference.com/v1");
         assert_eq!(c.api_key.as_deref(), Some("app:secret"));
-        assert_eq!(c.model, "onde-air");
+        assert_eq!(c.model, "onde-kkk");
         assert_eq!(c.condense_key, None);
     }
 

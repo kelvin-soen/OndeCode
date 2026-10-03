@@ -31,7 +31,7 @@ picked from `ONDE_CODE_PROVIDER` if set, otherwise from whichever key is present
 
 | Provider | Key env var | Base URL | Default model |
 |----------|-------------|----------|---------------|
-| `onde` — [Onde Cloud](https://ondeinference.com/cloud) | `ONDE_API_KEY` (`app-id:app-secret` from the Onde dashboard) | `https://cloud.ondeinference.com/v1` | `onde-air` |
+| `onde` — [Onde Cloud](https://ondeinference.com/cloud) | `ONDE_API_KEY` (`app-id:app-secret` from the Onde dashboard) | `https://cloud.ondeinference.com/v1` | `onde-kkk` |
 | `condense` — [condense.chat](https://condense.chat) | `CONDENSE_API_KEY` | `https://api.condense.chat/openai/v1` | `google/gemini-3.8-flash` |
 | `openai` | `OPENAI_API_KEY` | `https://api.openai.com/v1` | `gpt-4o-mini` |
 
@@ -40,8 +40,12 @@ ONDE_API_KEY=YOUR_APP_ID:YOUR_APP_SECRET ./target/release/onde-code     # Onde C
 CONDENSE_API_KEY=YOUR_CONDENSE_API_KEY ./target/release/onde-code       # Gemini via condense
 ```
 
-Onde Cloud models are tier ids (`onde-fast`, `onde-balanced`, `onde-large`, `onde-prism`, …;
-see `GET https://cloud.ondeinference.com/v1/models`). Pick one with `OPENAI_MODEL`.
+Onde Cloud models are tier ids (see `GET https://cloud.ondeinference.com/v1/models`). Pick one
+with `OPENAI_MODEL`. The default is `onde-kkk` (Kimi K3 / Moonshot AI); the other tiers backed by
+Chinese model makers are `onde-apex`, `onde-flux`, `onde-flare` (DeepSeek), `onde-nova`,
+`onde-orbit`, `onde-aura` (Z.ai GLM), `onde-zenith` (Qwen), and `onde-prism` (MiniMax). The
+Anthropic- and OpenAI-backed tiers (`onde-large`, `onde-balanced`, `onde-fast`, `onde-pro`,
+`onde-air`, `onde-mini`) are still available if you want them.
 
 With condense, the key is also sent as `X-Condense-Auth-Token` with the ACP session id as
 `X-Condense-Session-Id`; condense serves its own models on that key, so no upstream key is needed.
