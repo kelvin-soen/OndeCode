@@ -1,10 +1,14 @@
 //! acp-coder: a small ACP coding agent backed by any OpenAI-compatible chat completions API.
 //!
-//! Speaks ACP over stdio. Configure with OPENAI_BASE_URL, OPENAI_API_KEY, OPENAI_MODEL.
-//! Set ACP_CODER_YOLO=1 to skip permission prompts. Logs go to stderr (RUST_LOG).
+//! Run from a terminal it opens a TUI; launched by an editor (stdin not a TTY) or with `--acp`
+//! it speaks ACP over stdio. Configure with OPENAI_BASE_URL, OPENAI_API_KEY, OPENAI_MODEL or
+//! CONDENSE_API_KEY. Set ACP_CODER_YOLO=1 to skip permission prompts. Logs go to stderr (RUST_LOG).
 
 mod llm;
 mod tools;
+mod tui;
+
+use std::io::IsTerminal;
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -204,8 +208,34 @@ fn prompt_to_text(blocks: &[ContentBlock]) -> String {
     parts.join("\n\n")
 }
 
+const USAGE: &str = "\
+Usage: acp-coder [--acp] [--yolo]
+
+  (no args)  interactive terminal UI (when run from a terminal)
+  --acp      speak ACP over stdio for an editor (default when stdin is not a terminal)
+  --yolo     approve file edits and commands without asking
+";
+
 #[tokio::main]
-async fn main() -> agent_client_protocol::Result<()> {
+async fn main() -> anyhow::Result<()> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let has = |flag: &str| args.iter().any(|a| a == flag);
+    if has("-h") || has("--help") {
+        print!("{USAGE}");
+        return Ok(());
+    }
+    if let Some(bad) = args.iter().find(|a| !["--acp", "--yolo"].contains(&a.as_str())) {
+        anyhow::bail!("unknown argument {bad}\n\n{USAGE}");
+    }
+    if has("--acp") || !std::io::stdin().is_terminal() {
+        run_agent(has("--yolo")).await?;
+    } else {
+        tui::run(has("--yolo")).await?;
+    }
+    Ok(())
+}
+
+async fn run_agent(yolo_flag: bool) -> agent_client_protocol::Result<()> {
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
@@ -213,7 +243,7 @@ async fn main() -> agent_client_protocol::Result<()> {
 
     let agent = CoderAgent {
         llm: LlmClient::new(LlmConfig::from_env()),
-        yolo: std::env::var("ACP_CODER_YOLO").is_ok_and(|v| v == "1" || v == "true"),
+        yolo: yolo_flag || std::env::var("ACP_CODER_YOLO").is_ok_and(|v| v == "1" || v == "true"),
         client_caps: Arc::default(),
         sessions: Arc::default(),
     };
