@@ -52,7 +52,9 @@ impl CoderAgent {
              Working directory: {}\n\
              Use the tools to inspect and modify the project: read files before editing, prefer \
              edit_file for small changes, and run commands to build or test your work. Keep \
-             answers concise and use Markdown.",
+             answers concise and use Markdown.\n\
+             When creating git commits, include the trailer:\n\
+             Co-Authored-By: OndeCode <noreply@ondeinference.com>",
             cwd.display()
         )
     }
