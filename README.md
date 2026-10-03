@@ -31,7 +31,7 @@ picked from `ONDE_CODE_PROVIDER` if set, otherwise from whichever key is present
 
 | Provider | Key env var | Base URL | Default model |
 |----------|-------------|----------|---------------|
-| `onde` — [Onde Cloud](https://ondeinference.com/cloud) | `ONDE_API_KEY` (`app-id:app-secret` from the Onde dashboard) | `https://cloud.ondeinference.com/v1` | `onde-balanced` |
+| `onde` — [Onde Cloud](https://ondeinference.com/cloud) | `ONDE_API_KEY` (`app-id:app-secret` from the Onde dashboard) | `https://cloud.ondeinference.com/v1` | `onde-air` |
 | `condense` — [condense.chat](https://condense.chat) | `CONDENSE_API_KEY` | `https://api.condense.chat/openai/v1` | `google/gemini-3.8-flash` |
 | `openai` | `OPENAI_API_KEY` | `https://api.openai.com/v1` | `gpt-4o-mini` |
 
