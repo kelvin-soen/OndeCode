@@ -226,18 +226,20 @@ impl CoderAgent {
     /// memory only, so only sessions created by this process show up, most recent first.
     fn list_sessions(&self, req: ListSessionsRequest) -> ListSessionsResponse {
         let sessions = self.sessions.lock().unwrap();
-        let mut infos: Vec<SessionInfo> = sessions
+        // Sort on the raw epoch seconds; the ISO 8601 string is only for display.
+        let mut entries: Vec<(u64, SessionInfo)> = sessions
             .iter()
             .filter(|(_, s)| req.cwd.as_ref().is_none_or(|cwd| *cwd == s.cwd))
             .map(|(id, s)| {
-                SessionInfo::new(id.clone(), s.cwd.clone())
+                let info = SessionInfo::new(id.clone(), s.cwd.clone())
                     .additional_directories(s.roots.clone())
                     .title(s.title.clone())
-                    .updated_at(iso8601(s.updated_at))
+                    .updated_at(iso8601(s.updated_at));
+                (s.updated_at, info)
             })
             .collect();
-        infos.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
-        ListSessionsResponse::new(infos)
+        entries.sort_by_key(|(updated, _)| std::cmp::Reverse(*updated));
+        ListSessionsResponse::new(entries.into_iter().map(|(_, info)| info).collect())
     }
 
     fn cancel(&self, session_id: &SessionId) {
