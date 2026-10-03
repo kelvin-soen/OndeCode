@@ -16,14 +16,15 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use agent_client_protocol::schema::v1::{
-    AgentCapabilities, CancelNotification, ClientCapabilities, ContentBlock, ContentChunk,
-    EmbeddedResourceResource, Implementation, InitializeRequest, InitializeResponse,
-    ListSessionsRequest, ListSessionsResponse, NewSessionRequest, NewSessionResponse,
-    PromptCapabilities, PromptRequest, PromptResponse, SessionAdditionalDirectoriesCapabilities,
-    SessionCapabilities, SessionConfigOption, SessionConfigOptionCategory,
-    SessionConfigSelectOption, SessionConfigSelectOptions, SessionId, SessionInfo,
-    SessionListCapabilities, SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
-    SetSessionConfigOptionResponse, StopReason, ToolCall, ToolCallStatus, ToolCallUpdateFields,
+    AgentCapabilities, AuthMethod, AuthMethodTerminal, CancelNotification, ClientCapabilities,
+    ContentBlock, ContentChunk, EmbeddedResourceResource, Implementation, InitializeRequest,
+    InitializeResponse, ListSessionsRequest, ListSessionsResponse, NewSessionRequest,
+    NewSessionResponse, PromptCapabilities, PromptRequest, PromptResponse,
+    SessionAdditionalDirectoriesCapabilities, SessionCapabilities, SessionConfigOption,
+    SessionConfigOptionCategory, SessionConfigSelectOption, SessionConfigSelectOptions, SessionId,
+    SessionInfo, SessionListCapabilities, SessionNotification, SessionUpdate,
+    SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, StopReason, ToolCall,
+    ToolCallStatus, ToolCallUpdateFields,
 };
 use agent_client_protocol::{Agent, Client, ConnectionTo, Responder, Stdio};
 use serde_json::{Value, json};
@@ -35,6 +36,20 @@ use tools::{ToolCtx, ToolOutcome};
 const MAX_TURNS: usize = 50;
 /// Id of the session config option that selects the model.
 const MODEL_CONFIG_ID: &str = "model";
+
+/// The terminal auth method advertised on initialize: clients run `onde-code --setup`.
+fn auth_methods() -> Vec<AuthMethod> {
+    vec![AuthMethod::Terminal(
+        AuthMethodTerminal::new("terminal-setup", "Run in terminal")
+            .description("Interactive setup: choose a provider and store an API key")
+            .args(vec!["--setup".into()]),
+    )]
+}
+
+fn auth_required_error() -> agent_client_protocol::Error {
+    agent_client_protocol::Error::auth_required()
+        .data("No API key configured. Authenticate with the terminal method (`onde-code --setup`).")
+}
 
 struct Session {
     cwd: PathBuf,
@@ -422,13 +437,14 @@ fn prompt_to_text(blocks: &[ContentBlock]) -> String {
 }
 
 const USAGE: &str = "\
-Usage: onde-code [--acp] [--yolo] [--list-models] [--root <path>...]
+Usage: onde-code [--acp] [--yolo] [--list-models] [--root <path>...] [--setup]
 
   (no args)      interactive terminal UI (when run from a terminal)
   --acp          speak ACP over stdio for an editor (default when stdin is not a terminal)
   --yolo         approve file edits and commands without asking
   --list-models  list the models the configured endpoint serves, then exit
   --root <path>  add an extra workspace root (repeatable; TUI mode only)
+  --setup        interactive first-run setup: choose a provider and store an API key
 ";
 
 #[tokio::main]
@@ -460,12 +476,14 @@ async fn main() -> anyhow::Result<()> {
                 }
                 roots.push(path);
             }
-            "--acp" | "--yolo" | "--list-models" => {}
+            "--acp" | "--yolo" | "--list-models" | "--setup" => {}
             bad => anyhow::bail!("unknown argument {bad}\n\n{USAGE}"),
         }
         i += 1;
     }
-    if has("--list-models") {
+    if has("--setup") {
+        setup().await?;
+    } else if has("--list-models") {
         list_models().await?;
     } else if has("--acp") || !std::io::stdin().is_terminal() {
         if !roots.is_empty() {
@@ -475,6 +493,76 @@ async fn main() -> anyhow::Result<()> {
     } else {
         tui::run(has("--yolo"), roots).await?;
     }
+    Ok(())
+}
+
+/// Interactive first-run setup (`--setup`): pick a provider, prompt for its API key, verify it
+/// against the provider, and store it in `~/.config/ondecode/env` (mode 0600).
+async fn setup() -> anyhow::Result<()> {
+    use std::io::Write;
+
+    if !std::io::stdin().is_terminal() {
+        anyhow::bail!("--setup needs an interactive terminal");
+    }
+    let prompt_line = |label: &str| -> anyhow::Result<String> {
+        print!("{label}");
+        std::io::stdout().flush()?;
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line)?;
+        Ok(line.trim().to_string())
+    };
+
+    println!("onde-code setup\n");
+    println!("  1) Onde Cloud (ONDE_API_KEY, https://cloud.ondeinference.com)");
+    println!("  2) Condense   (CONDENSE_API_KEY, https://api.condense.chat)");
+    println!("  3) OpenAI     (OPENAI_API_KEY, https://api.openai.com)");
+    let (provider_var, key_var) = loop {
+        match prompt_line("\nChoose a provider [1-3]: ")?.as_str() {
+            "1" | "onde" => break ("onde", "ONDE_API_KEY"),
+            "2" | "condense" => break ("condense", "CONDENSE_API_KEY"),
+            "3" | "openai" => break ("openai", "OPENAI_API_KEY"),
+            _ => println!("Please enter 1, 2 or 3."),
+        }
+    };
+    let key = loop {
+        let key = prompt_line(&format!("Paste your {key_var}: "))?;
+        if key.is_empty() {
+            println!("Key must not be empty.");
+        } else {
+            break key;
+        }
+    };
+
+    // Verify against the provider before writing anything.
+    let config = LlmConfig::from_lookup(|name| {
+        if name == "ONDE_CODE_PROVIDER" {
+            Some(provider_var.to_string())
+        } else if name == key_var {
+            Some(key.clone())
+        } else {
+            std::env::var(name).ok()
+        }
+    });
+    let client = LlmClient::new(config);
+    print!("Verifying the key with {}… ", provider_var);
+    std::io::stdout().flush()?;
+    match client.check_auth().await {
+        Ok(()) => println!("OK"),
+        Err(e) => anyhow::bail!("\nKey check failed: {e:#}\nNothing was written."),
+    }
+
+    let home = std::env::var("HOME").map(PathBuf::from)?;
+    let dir = home.join(".config/ondecode");
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join("env");
+    let content = format!("ONDE_CODE_PROVIDER={provider_var}\n{key_var}={key}\n");
+    std::fs::write(&path, content)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    println!("\nWrote {} — you're all set.", path.display());
     Ok(())
 }
 
@@ -515,6 +603,7 @@ async fn run_agent(yolo_flag: bool) -> agent_client_protocol::Result<()> {
                     *agent.client_caps.lock().unwrap() = req.client_capabilities.clone();
                     responder.respond(
                         InitializeResponse::new(req.protocol_version)
+                            .auth_methods(auth_methods())
                             .agent_capabilities(
                                 AgentCapabilities::new()
                                     .prompt_capabilities(
@@ -544,6 +633,9 @@ async fn run_agent(yolo_flag: bool) -> agent_client_protocol::Result<()> {
                     // Listing models is a network call; keep it off the dispatch loop.
                     let agent = agent.clone();
                     cx.spawn(async move {
+                        if !agent.llm.has_api_key() {
+                            return responder.respond_with_error(auth_required_error());
+                        }
                         responder
                             .respond(agent.new_session(req.cwd, req.additional_directories).await)
                     })
@@ -582,7 +674,12 @@ async fn run_agent(yolo_flag: bool) -> agent_client_protocol::Result<()> {
                     // Run the turn off the dispatch loop so it can make requests to the client.
                     let agent = agent.clone();
                     let connection = cx.clone();
-                    cx.spawn(async move { agent.prompt(req, responder, connection).await })
+                    cx.spawn(async move {
+                        if !agent.llm.has_api_key() {
+                            return responder.respond_with_error(auth_required_error());
+                        }
+                        agent.prompt(req, responder, connection).await
+                    })
                 }
             },
             agent_client_protocol::on_receive_request!(),

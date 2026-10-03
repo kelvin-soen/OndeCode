@@ -79,11 +79,14 @@ impl LlmConfig {
     pub fn from_env() -> Self {
         let file_vars = load_config_env_vars();
         Self::from_lookup(|name| {
-            std::env::var(name).ok().or_else(|| file_vars.get(name).cloned())
+            std::env::var(name)
+                .ok()
+                .or_else(|| file_vars.get(name).cloned())
         })
     }
 
-    fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Self {
+    /// Build a config from an arbitrary variable lookup (tests, setup).
+    pub fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Self {
         let env = |name: &str| lookup(name).filter(|v| !v.is_empty());
         let provider = match env("ONDE_CODE_PROVIDER") {
             Some(name) => Provider::parse(&name).unwrap_or_else(|| {
@@ -116,9 +119,7 @@ fn load_config_env_vars() -> std::collections::HashMap<String, String> {
     // Empty strings don't count — GUI launchers (e.g. Zed via launchd) often
     // export variables set to "", and treating those as "present" would skip
     // the config file and silently fall back to OpenAI defaults.
-    let env_nonempty = |name: &str| {
-        std::env::var(name).map(|v| !v.is_empty()).unwrap_or(false)
-    };
+    let env_nonempty = |name: &str| std::env::var(name).map(|v| !v.is_empty()).unwrap_or(false);
     let has_env_config = env_nonempty("ONDE_CODE_PROVIDER")
         || env_nonempty("ONDE_API_KEY")
         || env_nonempty("CONDENSE_API_KEY")
@@ -360,6 +361,49 @@ impl LlmClient {
 
     pub fn model(&self) -> &str {
         &self.config.model
+    }
+
+    /// Whether an API key is configured for the selected provider.
+    pub fn has_api_key(&self) -> bool {
+        self.config.api_key.is_some()
+    }
+
+    /// Verify the configured key against the provider with a minimal chat completion.
+    /// Returns `Err` when no key is set, the key is rejected, or the endpoint is unreachable.
+    pub async fn check_auth(&self) -> Result<()> {
+        let Some(key) = &self.config.api_key else {
+            bail!(
+                "no API key configured for provider '{}'",
+                self.config.provider.name()
+            );
+        };
+        let body = json!({
+            "model": self.config.model,
+            "messages": [{ "role": "user", "content": "ping" }],
+            "max_tokens": 1,
+            "stream": false,
+        });
+        let mut req = self
+            .http
+            .post(format!("{}/chat/completions", self.config.base_url))
+            .json(&body)
+            .bearer_auth(key);
+        if let Some(condense) = &self.config.condense_key {
+            req = req.header("X-Condense-Auth-Token", condense);
+        }
+        let resp = req.send().await.context("reaching the provider")?;
+        let status = resp.status();
+        if matches!(status.as_u16(), 401 | 403) {
+            bail!(
+                "provider '{}' rejected the API key ({status})",
+                self.config.provider.name()
+            );
+        }
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            bail!("provider returned {status}: {text}");
+        }
+        Ok(())
     }
 
     /// List the models the configured endpoint serves (`GET {base_url}/models`).

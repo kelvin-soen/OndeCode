@@ -3,6 +3,8 @@ name = "onde-code"
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
+description = "Small ACP coding agent backed by any OpenAI-compatible chat completions API"
+repository = "https://github.com/kelvin-soen/OndeCode"
 
 [dependencies]
 agent-client-protocol = "2.2"
