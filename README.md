@@ -1,4 +1,4 @@
-# acp-coder
+# onde-code
 
 A small [Agent Client Protocol](https://agentclientprotocol.com) coding agent built on the
 official [Rust SDK](https://github.com/agentclientprotocol/rust-sdk). It talks ACP over stdio and
@@ -19,7 +19,7 @@ llama.cpp, LM Studio, …) with streaming and function calling.
 ## Build
 
 ```sh
-cargo build --release   # -> target/release/acp-coder
+cargo build --release   # -> target/release/onde-code
 ```
 
 ## Configuration
@@ -35,12 +35,12 @@ cargo build --release   # -> target/release/acp-coder
 
 ```sh
 export CONDENSE_API_KEY=YOUR_CONDENSE_API_KEY   # from the condense dashboard; never commit it
-./target/release/acp-coder                      # uses google/gemini-3.8-flash
+./target/release/onde-code                      # uses google/gemini-3.8-flash
 ```
 
 Gemini's per-tool-call `thought_signature` (`extra_content`) is preserved and sent back with the
 conversation history, which Gemini requires for multi-step tool use.
-| `ACP_CODER_YOLO`   | unset                       | `1` skips permission prompts       |
+| `ONDE_CODE_YOLO`   | unset                       | `1` skips permission prompts       |
 | `RUST_LOG`         | unset                       | logs go to stderr                  |
 
 ## Use from the terminal
@@ -49,14 +49,14 @@ Run it in a project directory to get an interactive terminal UI:
 
 ```sh
 cd my-project
-CONDENSE_API_KEY=YOUR_CONDENSE_API_KEY acp-coder          # asks before edits/commands
-acp-coder --yolo                                         # approves everything
+CONDENSE_API_KEY=YOUR_CONDENSE_API_KEY onde-code          # asks before edits/commands
+onde-code --yolo                                         # approves everything
 ```
 
 Enter sends, Esc cancels a running turn, ↑/↓ and PgUp/PgDn scroll, Ctrl-C or `/quit` exits.
 Approval prompts take `y` (allow), `a` (always allow this tool), or `n` (reject).
 
-The TUI is itself an ACP client: it starts `acp-coder --acp` as a subprocess and talks to it
+The TUI is itself an ACP client: it starts `onde-code --acp` as a subprocess and talks to it
 over the same protocol an editor uses.
 
 ## Use with Zed
@@ -67,8 +67,8 @@ Editors launch the agent with piped stdio, which selects ACP mode automatically 
 ```json
 {
   "agent_servers": {
-    "acp-coder": {
-      "command": "/path/to/acp-coder/target/release/acp-coder",
+    "onde-code": {
+      "command": "/path/to/onde-code/target/release/onde-code",
       "env": {
         "OPENAI_BASE_URL": "http://localhost:11434/v1",
         "OPENAI_MODEL": "qwen2.5-coder:14b"

@@ -395,14 +395,14 @@ impl App {
         let block = Block::bordered()
             .border_type(BorderType::Rounded)
             .border_style(Style::new().fg(border))
-            .title(" acp-coder ");
+            .title(" onde-code ");
         let inner = block.inner(area);
         // Scroll horizontally so the cursor stays visible.
         let width = inner.width.saturating_sub(1) as usize;
         let start = self.cursor.saturating_sub(width);
         let visible: String = self.input[start..].iter().take(width + 1).collect();
         let text = if self.input.is_empty() && !self.busy {
-            Line::from("Ask acp-coder to do something…".dark_gray())
+            Line::from("Ask onde-code to do something…".dark_gray())
         } else {
             Line::from(visible)
         };

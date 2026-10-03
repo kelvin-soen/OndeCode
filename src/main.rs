@@ -1,8 +1,8 @@
-//! acp-coder: a small ACP coding agent backed by any OpenAI-compatible chat completions API.
+//! onde-code: a small ACP coding agent backed by any OpenAI-compatible chat completions API.
 //!
 //! Run from a terminal it opens a TUI; launched by an editor (stdin not a TTY) or with `--acp`
 //! it speaks ACP over stdio. Configure with OPENAI_BASE_URL, OPENAI_API_KEY, OPENAI_MODEL or
-//! CONDENSE_API_KEY. Set ACP_CODER_YOLO=1 to skip permission prompts. Logs go to stderr (RUST_LOG).
+//! CONDENSE_API_KEY. Set ONDE_CODE_YOLO=1 to skip permission prompts. Logs go to stderr (RUST_LOG).
 
 mod llm;
 mod tools;
@@ -48,7 +48,7 @@ struct CoderAgent {
 impl CoderAgent {
     fn system_prompt(&self, cwd: &std::path::Path) -> String {
         format!(
-            "You are acp-coder, an autonomous coding agent working inside the user's editor.\n\
+            "You are onde-code, an autonomous coding agent working inside the user's editor.\n\
              Working directory: {}\n\
              Use the tools to inspect and modify the project: read files before editing, prefer \
              edit_file for small changes, and run commands to build or test your work. Keep \
@@ -209,7 +209,7 @@ fn prompt_to_text(blocks: &[ContentBlock]) -> String {
 }
 
 const USAGE: &str = "\
-Usage: acp-coder [--acp] [--yolo]
+Usage: onde-code [--acp] [--yolo]
 
   (no args)  interactive terminal UI (when run from a terminal)
   --acp      speak ACP over stdio for an editor (default when stdin is not a terminal)
@@ -243,15 +243,15 @@ async fn run_agent(yolo_flag: bool) -> agent_client_protocol::Result<()> {
 
     let agent = CoderAgent {
         llm: LlmClient::new(LlmConfig::from_env()),
-        yolo: yolo_flag || std::env::var("ACP_CODER_YOLO").is_ok_and(|v| v == "1" || v == "true"),
+        yolo: yolo_flag || std::env::var("ONDE_CODE_YOLO").is_ok_and(|v| v == "1" || v == "true"),
         client_caps: Arc::default(),
         sessions: Arc::default(),
     };
-    tracing::info!("acp-coder starting with model {}", agent.llm.model());
+    tracing::info!("onde-code starting with model {}", agent.llm.model());
 
     Agent
         .builder()
-        .name("acp-coder")
+        .name("onde-code")
         .on_receive_request(
             {
                 let agent = agent.clone();
@@ -264,7 +264,7 @@ async fn run_agent(yolo_flag: bool) -> agent_client_protocol::Result<()> {
                                     PromptCapabilities::new().embedded_context(true),
                                 ),
                             )
-                            .agent_info(Implementation::new("acp-coder", env!("CARGO_PKG_VERSION"))),
+                            .agent_info(Implementation::new("onde-code", env!("CARGO_PKG_VERSION"))),
                     )
                 }
             },

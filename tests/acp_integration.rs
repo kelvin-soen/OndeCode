@@ -1,6 +1,6 @@
-//! End-to-end ACP protocol tests for acp-coder.
+//! End-to-end ACP protocol tests for onde-code.
 //!
-//! Each test spawns the real `acp-coder` binary over stdio, drives it with the
+//! Each test spawns the real `onde-code` binary over stdio, drives it with the
 //! official SDK's `Client`, and points the agent at a mock OpenAI-compatible
 //! `/chat/completions` server that plays a scripted model. No real LLM or API
 //! key is needed — the provided debug key is passed as `CONDENSE_API_KEY` and
@@ -211,7 +211,7 @@ impl Harness {
         prompt: &str,
         cancel_midway: bool,
     ) -> (StopReason, Arc<Mutex<Captured>>) {
-        let binary = env!("CARGO_BIN_EXE_acp-coder");
+        let binary = env!("CARGO_BIN_EXE_onde-code");
         let agent = AcpAgent::new(
             AcpAgentConfig::new(binary)
                 .env("OPENAI_BASE_URL", base_url)
@@ -276,7 +276,7 @@ impl Harness {
                     .block_task()
                     .await?;
                 let agent_info = init.agent_info.expect("agent must report its info");
-                assert_eq!(agent_info.name, "acp-coder");
+                assert_eq!(agent_info.name, "onde-code");
                 assert!(init.agent_capabilities.prompt_capabilities.embedded_context);
 
                 let session = connection
@@ -312,7 +312,7 @@ impl Harness {
 }
 
 fn temp_workdir() -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("acp-coder-test-{}", uuid::Uuid::new_v4()));
+    let dir = std::env::temp_dir().join(format!("onde-code-test-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir).unwrap();
     dir
 }
