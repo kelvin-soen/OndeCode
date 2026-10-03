@@ -18,8 +18,10 @@ use agent_client_protocol::schema::v1::{
     AgentCapabilities, CancelNotification, ClientCapabilities, ContentBlock, ContentChunk,
     EmbeddedResourceResource, Implementation, InitializeRequest, InitializeResponse,
     NewSessionRequest, NewSessionResponse, PromptCapabilities, PromptRequest, PromptResponse,
-    SessionId, SessionNotification, SessionUpdate, StopReason, ToolCall, ToolCallStatus,
-    ToolCallUpdateFields,
+    SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOption,
+    SessionConfigSelectOptions, SessionId, SessionNotification, SessionUpdate,
+    SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, StopReason, ToolCall,
+    ToolCallStatus, ToolCallUpdateFields,
 };
 use agent_client_protocol::{Agent, Client, ConnectionTo, Responder, Stdio};
 use serde_json::{Value, json};
@@ -29,9 +31,12 @@ use llm::{Delta, LlmClient, LlmConfig};
 use tools::{ToolCtx, ToolOutcome};
 
 const MAX_TURNS: usize = 50;
+/// Id of the session config option that selects the model.
+const MODEL_CONFIG_ID: &str = "model";
 
 struct Session {
     cwd: PathBuf,
+    model: String,
     messages: Vec<Value>,
     cancel: CancellationToken,
     always_allowed: Arc<Mutex<HashSet<String>>>,
@@ -43,6 +48,8 @@ struct CoderAgent {
     yolo: bool,
     client_caps: Arc<Mutex<ClientCapabilities>>,
     sessions: Arc<Mutex<HashMap<SessionId, Session>>>,
+    /// Models offered for selection, fetched from `GET /models` on first use.
+    models: Arc<tokio::sync::OnceCell<Vec<String>>>,
 }
 
 impl CoderAgent {
@@ -59,16 +66,97 @@ impl CoderAgent {
         )
     }
 
-    fn new_session(&self, cwd: PathBuf) -> SessionId {
+    /// The selectable models. Falls back to just the configured model if the endpoint
+    /// can't list them; the configured model is always offered.
+    async fn models(&self) -> &[String] {
+        self.models
+            .get_or_init(|| async {
+                let default = self.llm.model().to_string();
+                // An explicit list wins: some endpoints (Condense) can't list models with an
+                // API key, and editors show this list as the model picker.
+                let configured: Vec<String> = std::env::var("ONDE_CODE_MODELS")
+                    .unwrap_or_default()
+                    .split(',')
+                    .map(|m| m.trim().to_string())
+                    .filter(|m| !m.is_empty())
+                    .collect();
+                let mut ids = if !configured.is_empty() {
+                    configured
+                } else {
+                    match self.llm.models().await {
+                        Ok(models) => models.into_iter().map(|m| m.id).collect(),
+                        Err(e) => {
+                            tracing::warn!("listing models failed, offering only {default}: {e:#}");
+                            Vec::new()
+                        }
+                    }
+                };
+                if !ids.contains(&default) {
+                    ids.insert(0, default);
+                }
+                ids
+            })
+            .await
+    }
+
+    async fn config_options(&self, current: &str) -> Vec<SessionConfigOption> {
+        let options = self
+            .models()
+            .await
+            .iter()
+            .map(|id| SessionConfigSelectOption::new(id.clone(), id.clone()))
+            .collect();
+        vec![
+            SessionConfigOption::select(
+                MODEL_CONFIG_ID,
+                "Model",
+                current.to_string(),
+                SessionConfigSelectOptions::Ungrouped(options),
+            )
+            .category(SessionConfigOptionCategory::Model),
+        ]
+    }
+
+    async fn set_config_option(
+        &self,
+        req: SetSessionConfigOptionRequest,
+    ) -> agent_client_protocol::Result<SetSessionConfigOptionResponse> {
+        let invalid = |msg: String| agent_client_protocol::Error::invalid_params().data(msg);
+        if &*req.config_id.0 != MODEL_CONFIG_ID {
+            return Err(invalid(format!(
+                "unknown config option {}",
+                req.config_id.0
+            )));
+        }
+        let Some(model) = req.value.as_value_id().map(|v| v.0.to_string()) else {
+            return Err(invalid("model must be a value id".into()));
+        };
+        if !self.models().await.contains(&model) {
+            return Err(invalid(format!("unknown model {model}")));
+        }
+        match self.sessions.lock().unwrap().get_mut(&req.session_id) {
+            Some(s) => s.model = model.clone(),
+            None => return Err(invalid(format!("unknown session {}", req.session_id))),
+        }
+        tracing::info!("session {} now uses model {model}", req.session_id);
+        Ok(SetSessionConfigOptionResponse::new(
+            self.config_options(&model).await,
+        ))
+    }
+
+    async fn new_session(&self, cwd: PathBuf) -> NewSessionResponse {
         let id = SessionId::new(uuid::Uuid::new_v4().to_string());
+        let model = self.llm.model().to_string();
+        let options = self.config_options(&model).await;
         let session = Session {
             messages: vec![json!({ "role": "system", "content": self.system_prompt(&cwd) })],
+            model,
             cwd,
             cancel: CancellationToken::new(),
             always_allowed: Arc::default(),
         };
         self.sessions.lock().unwrap().insert(id.clone(), session);
-        id
+        NewSessionResponse::new(id).config_options(options)
     }
 
     fn cancel(&self, session_id: &SessionId) {
@@ -98,13 +186,19 @@ impl CoderAgent {
     ) -> anyhow::Result<StopReason> {
         let session_id = request.session_id.clone();
         // Take the history out while the turn runs; it's put back at the end.
-        let (cwd, mut messages, cancel, always_allowed) = {
+        let (cwd, model, mut messages, cancel, always_allowed) = {
             let mut sessions = self.sessions.lock().unwrap();
             let s = sessions
                 .get_mut(&session_id)
                 .ok_or_else(|| anyhow::anyhow!("unknown session {session_id}"))?;
             s.cancel = CancellationToken::new();
-            (s.cwd.clone(), std::mem::take(&mut s.messages), s.cancel.clone(), s.always_allowed.clone())
+            (
+                s.cwd.clone(),
+                s.model.clone(),
+                std::mem::take(&mut s.messages),
+                s.cancel.clone(),
+                s.always_allowed.clone(),
+            )
         };
         messages.push(json!({ "role": "user", "content": prompt_to_text(&request.prompt) }));
 
@@ -117,7 +211,7 @@ impl CoderAgent {
             yolo: self.yolo,
             always_allowed,
         };
-        let result = self.agent_loop(&ctx, &mut messages).await;
+        let result = self.agent_loop(&ctx, &model, &mut messages).await;
 
         if let Some(s) = self.sessions.lock().unwrap().get_mut(&session_id) {
             s.messages = messages;
@@ -125,7 +219,12 @@ impl CoderAgent {
         result
     }
 
-    async fn agent_loop(&self, ctx: &ToolCtx, messages: &mut Vec<Value>) -> anyhow::Result<StopReason> {
+    async fn agent_loop(
+        &self,
+        ctx: &ToolCtx,
+        model: &str,
+        messages: &mut Vec<Value>,
+    ) -> anyhow::Result<StopReason> {
         let tool_defs = tools::definitions();
         let notify = |update: SessionUpdate| {
             ctx.connection
@@ -134,7 +233,7 @@ impl CoderAgent {
 
         for _ in 0..MAX_TURNS {
             let completion = tokio::select! {
-                r = self.llm.complete(&ctx.session_id.0, messages, &tool_defs, |delta| {
+                r = self.llm.complete(&ctx.session_id.0, model, messages, &tool_defs, |delta| {
                     let update = match delta {
                         Delta::Text(t) => SessionUpdate::AgentMessageChunk(ContentChunk::new(t.to_string().into())),
                         Delta::Reasoning(t) => SessionUpdate::AgentThoughtChunk(ContentChunk::new(t.to_string().into())),
@@ -176,8 +275,17 @@ impl CoderAgent {
                     tools::execute(ctx, &tc.id, &tc.name, args).await
                 };
 
-                let status = if outcome.failed { ToolCallStatus::Failed } else { ToolCallStatus::Completed };
-                ctx.update(&tc.id, ToolCallUpdateFields::new().status(status).content(outcome.content))?;
+                let status = if outcome.failed {
+                    ToolCallStatus::Failed
+                } else {
+                    ToolCallStatus::Completed
+                };
+                ctx.update(
+                    &tc.id,
+                    ToolCallUpdateFields::new()
+                        .status(status)
+                        .content(outcome.content),
+                )?;
                 messages.push(tool_message(&tc.id, &outcome.text));
             }
             if ctx.cancel.is_cancelled() {
@@ -227,7 +335,10 @@ async fn main() -> anyhow::Result<()> {
         print!("{USAGE}");
         return Ok(());
     }
-    if let Some(bad) = args.iter().find(|a| !["--acp", "--yolo", "--list-models"].contains(&a.as_str())) {
+    if let Some(bad) = args
+        .iter()
+        .find(|a| !["--acp", "--yolo", "--list-models"].contains(&a.as_str()))
+    {
         anyhow::bail!("unknown argument {bad}\n\n{USAGE}");
     }
     if has("--list-models") {
@@ -263,6 +374,7 @@ async fn run_agent(yolo_flag: bool) -> agent_client_protocol::Result<()> {
         yolo: yolo_flag || std::env::var("ONDE_CODE_YOLO").is_ok_and(|v| v == "1" || v == "true"),
         client_caps: Arc::default(),
         sessions: Arc::default(),
+        models: Arc::default(),
     };
     tracing::info!("onde-code starting with model {}", agent.llm.model());
 
@@ -276,12 +388,13 @@ async fn run_agent(yolo_flag: bool) -> agent_client_protocol::Result<()> {
                     *agent.client_caps.lock().unwrap() = req.client_capabilities.clone();
                     responder.respond(
                         InitializeResponse::new(req.protocol_version)
-                            .agent_capabilities(
-                                AgentCapabilities::new().prompt_capabilities(
-                                    PromptCapabilities::new().embedded_context(true),
-                                ),
-                            )
-                            .agent_info(Implementation::new("onde-code", env!("CARGO_PKG_VERSION"))),
+                            .agent_capabilities(AgentCapabilities::new().prompt_capabilities(
+                                PromptCapabilities::new().embedded_context(true),
+                            ))
+                            .agent_info(Implementation::new(
+                                "onde-code",
+                                env!("CARGO_PKG_VERSION"),
+                            )),
                     )
                 }
             },
@@ -290,8 +403,25 @@ async fn run_agent(yolo_flag: bool) -> agent_client_protocol::Result<()> {
         .on_receive_request(
             {
                 let agent = agent.clone();
-                async move |req: NewSessionRequest, responder, _cx| {
-                    responder.respond(NewSessionResponse::new(agent.new_session(req.cwd)))
+                async move |req: NewSessionRequest, responder, cx| {
+                    // Listing models is a network call; keep it off the dispatch loop.
+                    let agent = agent.clone();
+                    cx.spawn(async move { responder.respond(agent.new_session(req.cwd).await) })
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let agent = agent.clone();
+                async move |req: SetSessionConfigOptionRequest, responder, cx| {
+                    let agent = agent.clone();
+                    cx.spawn(async move {
+                        match agent.set_config_option(req).await {
+                            Ok(resp) => responder.respond(resp),
+                            Err(e) => responder.respond_with_error(e),
+                        }
+                    })
                 }
             },
             agent_client_protocol::on_receive_request!(),

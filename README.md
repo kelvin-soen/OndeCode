@@ -61,6 +61,7 @@ conversation history, which Gemini requires for multi-step tool use.
 | `OPENAI_API_KEY`     | the provider's key       | sent as a Bearer token; overrides the provider key |
 | `OPENAI_MODEL`       | the provider's model     | must support tool/function calling           |
 | `ONDE_CODE_YOLO`     | unset                    | `1` skips permission prompts                 |
+| `ONDE_CODE_MODELS` | listed from `/models`      | comma-separated models offered in the editor's model picker |
 | `RUST_LOG`           | unset                    | logs go to stderr                            |
 
 ## Use from the terminal

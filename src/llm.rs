@@ -73,8 +73,14 @@ impl LlmConfig {
     /// Picks the provider from `ONDE_CODE_PROVIDER`, or else from whichever key is set
     /// (`ONDE_API_KEY`, then `CONDENSE_API_KEY`, then plain OpenAI). `OPENAI_BASE_URL`,
     /// `OPENAI_API_KEY` and `OPENAI_MODEL` override the provider's defaults.
+    ///
+    /// If none of the provider keys are present in the environment, fallback values are
+    /// loaded from `~/.config/ondecode/env`.
     pub fn from_env() -> Self {
-        Self::from_lookup(|name| std::env::var(name).ok())
+        let file_vars = load_config_env_vars();
+        Self::from_lookup(|name| {
+            std::env::var(name).ok().or_else(|| file_vars.get(name).cloned())
+        })
     }
 
     fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Self {
@@ -103,12 +109,61 @@ impl LlmConfig {
     }
 }
 
+fn load_config_env_vars() -> std::collections::HashMap<String, String> {
+    // If the process environment already provides any LLM credentials/provider,
+    // prefer the environment directly without falling back to the config file.
+    let has_env_config = std::env::var("ONDE_CODE_PROVIDER").is_ok()
+        || std::env::var("ONDE_API_KEY").is_ok()
+        || std::env::var("CONDENSE_API_KEY").is_ok()
+        || std::env::var("OPENAI_API_KEY").is_ok();
+
+    let mut vars = std::collections::HashMap::new();
+    if has_env_config {
+        return vars;
+    }
+
+    let home = match std::env::var("HOME") {
+        Ok(h) if !h.is_empty() => std::path::PathBuf::from(h),
+        _ => return vars,
+    };
+    let path = home.join(".config/ondecode/env");
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(_) => return vars,
+    };
+
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let line = line.strip_prefix("export ").unwrap_or(line).trim();
+        if let Some((k, v)) = line.split_once('=') {
+            let k = k.trim().to_string();
+            let mut v = v.trim();
+            if (v.starts_with('"') && v.ends_with('"'))
+                || (v.starts_with('\'') && v.ends_with('\''))
+            {
+                if v.len() >= 2 {
+                    v = &v[1..v.len() - 1];
+                }
+            }
+            vars.insert(k, v.to_string());
+        }
+    }
+    vars
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn config(vars: &[(&str, &str)]) -> LlmConfig {
-        LlmConfig::from_lookup(|name| vars.iter().find(|(k, _)| *k == name).map(|(_, v)| v.to_string()))
+        LlmConfig::from_lookup(|name| {
+            vars.iter()
+                .find(|(k, _)| *k == name)
+                .map(|(_, v)| v.to_string())
+        })
     }
 
     #[test]
@@ -132,19 +187,36 @@ mod tests {
 
     #[test]
     fn explicit_provider_wins_over_detected_keys() {
-        let vars = [("ONDE_API_KEY", "app:secret"), ("CONDENSE_API_KEY", "ck"), ("ONDE_CODE_PROVIDER", "condense")];
+        let vars = [
+            ("ONDE_API_KEY", "app:secret"),
+            ("CONDENSE_API_KEY", "ck"),
+            ("ONDE_CODE_PROVIDER", "condense"),
+        ];
         let c = config(&vars);
         assert_eq!(c.provider, Provider::Condense);
         assert_eq!(c.api_key.as_deref(), Some("ck"));
-        assert_eq!(config(&[("ONDE_CODE_PROVIDER", "onde"), ("CONDENSE_API_KEY", "ck")]).api_key, None);
+        assert_eq!(
+            config(&[("ONDE_CODE_PROVIDER", "onde"), ("CONDENSE_API_KEY", "ck")]).api_key,
+            None
+        );
     }
 
     #[test]
     fn openai_overrides_apply_to_any_provider() {
-        let c = config(&[("ONDE_API_KEY", "app:secret"), ("OPENAI_MODEL", "onde-prism"), ("OPENAI_BASE_URL", "http://x/v1/")]);
-        assert_eq!((c.base_url.as_str(), c.model.as_str()), ("http://x/v1", "onde-prism"));
+        let c = config(&[
+            ("ONDE_API_KEY", "app:secret"),
+            ("OPENAI_MODEL", "onde-prism"),
+            ("OPENAI_BASE_URL", "http://x/v1/"),
+        ]);
+        assert_eq!(
+            (c.base_url.as_str(), c.model.as_str()),
+            ("http://x/v1", "onde-prism")
+        );
         let plain = config(&[]);
-        assert_eq!((plain.provider, plain.model.as_str()), (Provider::OpenAi, "gpt-4o-mini"));
+        assert_eq!(
+            (plain.provider, plain.model.as_str()),
+            (Provider::OpenAi, "gpt-4o-mini")
+        );
     }
 
     #[test]
@@ -273,7 +345,10 @@ pub struct LlmClient {
 
 impl LlmClient {
     pub fn new(config: LlmConfig) -> Self {
-        Self { http: reqwest::Client::new(), config }
+        Self {
+            http: reqwest::Client::new(),
+            config,
+        }
     }
 
     pub fn model(&self) -> &str {
@@ -282,17 +357,32 @@ impl LlmClient {
 
     /// List the models the configured endpoint serves (`GET {base_url}/models`).
     pub async fn models(&self) -> Result<Vec<ModelInfo>> {
-        let mut req = self.http.get(format!("{}/models", self.config.base_url));
+        let url = format!("{}/models", self.config.base_url);
+        let mut req = self.http.get(&url);
         if let Some(key) = &self.config.api_key {
             req = req.bearer_auth(key);
         }
-        let resp = req.send().await.context("sending models request")?;
+        let mut resp = req.send().await.context("sending models request")?;
+        // Some endpoints (Onde Cloud) list models publicly but reject an invalid key, so a
+        // bad key shouldn't hide the catalog: retry without auth.
+        if self.config.api_key.is_some() && matches!(resp.status().as_u16(), 401 | 403) {
+            resp = self
+                .http
+                .get(&url)
+                .send()
+                .await
+                .context("sending models request")?;
+        }
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
             bail!("models endpoint returned {status}: {text}");
         }
-        let mut models = resp.json::<ModelsResponse>().await.context("parsing models response")?.data;
+        let mut models = resp
+            .json::<ModelsResponse>()
+            .await
+            .context("parsing models response")?
+            .data;
         models.sort_by(|a, b| a.id.cmp(&b.id));
         Ok(models)
     }
@@ -301,12 +391,20 @@ impl LlmClient {
     pub async fn complete(
         &self,
         session_id: &str,
+        model: &str,
         messages: &[Value],
         tools: &Value,
         mut on_delta: impl FnMut(Delta<'_>),
     ) -> Result<Completion> {
+        if self.config.api_key.is_none() {
+            bail!(
+                "No API key configured for provider '{}'. Please set {} in your environment or ~/.config/ondecode/env",
+                self.config.provider.name(),
+                self.config.provider.key_var()
+            );
+        }
         let body = json!({
-            "model": self.config.model,
+            "model": model,
             "messages": messages,
             "tools": tools,
             "stream": true,
@@ -323,7 +421,10 @@ impl LlmClient {
                 .header("X-Condense-Auth-Token", key)
                 .header("X-Condense-Session-Id", session_id);
         }
-        let resp = req.send().await.context("sending chat completion request")?;
+        let resp = req
+            .send()
+            .await
+            .context("sending chat completion request")?;
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
@@ -367,7 +468,8 @@ impl LlmClient {
                     }
                     for tc in d.tool_calls {
                         if out.tool_calls.len() <= tc.index {
-                            out.tool_calls.resize(tc.index + 1, ToolCallRequest::default());
+                            out.tool_calls
+                                .resize(tc.index + 1, ToolCallRequest::default());
                         }
                         let slot = &mut out.tool_calls[tc.index];
                         if let Some(id) = tc.id {
