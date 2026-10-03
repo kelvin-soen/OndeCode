@@ -27,9 +27,19 @@ cargo build --release   # -> target/release/acp-coder
 | Env var            | Default                     |                                    |
 |--------------------|-----------------------------|------------------------------------|
 | `OPENAI_BASE_URL`  | `https://api.openai.com/v1` | any OpenAI-compatible base URL (defaults to `https://api.condense.chat/openai/v1` when `CONDENSE_API_KEY` is set) |
-| `OPENAI_API_KEY`   | (none)                      | sent as a Bearer token if set      |
-| `OPENAI_MODEL`     | `gpt-4o-mini`               | must support tool/function calling |
-| `CONDENSE_API_KEY` | unset                       | [condense.chat](https://condense.chat) key, sent as `X-Condense-Auth-Token` with the ACP session id as `X-Condense-Session-Id`; `OPENAI_API_KEY` is still the upstream provider key |
+| `OPENAI_API_KEY`   | `CONDENSE_API_KEY`          | sent as a Bearer token if set      |
+| `OPENAI_MODEL`     | `gpt-4o-mini` (`google/gemini-3.8-flash` with condense) | must support tool/function calling |
+| `CONDENSE_API_KEY` | unset                       | [condense.chat](https://condense.chat) key, sent as `X-Condense-Auth-Token` with the ACP session id as `X-Condense-Session-Id`. On its own it is enough: condense serves its models (billed to your condense credit) on this key, so no upstream key is needed |
+
+### Using Gemini through condense
+
+```sh
+export CONDENSE_API_KEY=YOUR_CONDENSE_API_KEY   # from the condense dashboard; never commit it
+./target/release/acp-coder                      # uses google/gemini-3.8-flash
+```
+
+Gemini's per-tool-call `thought_signature` (`extra_content`) is preserved and sent back with the
+conversation history, which Gemini requires for multi-step tool use.
 | `ACP_CODER_YOLO`   | unset                       | `1` skips permission prompts       |
 | `RUST_LOG`         | unset                       | logs go to stderr                  |
 

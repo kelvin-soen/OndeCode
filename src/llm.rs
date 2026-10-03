@@ -10,25 +10,29 @@ pub struct LlmConfig {
     pub base_url: String,
     pub api_key: Option<String>,
     pub model: String,
-    /// condense.chat key, sent as `X-Condense-Auth-Token` (the upstream key stays in `api_key`).
+    /// condense.chat key. Sent as `X-Condense-Auth-Token`; also used as the bearer key when
+    /// `OPENAI_API_KEY` is unset, since condense serves its own models on the condense key.
     pub condense_key: Option<String>,
 }
 
 impl LlmConfig {
     pub fn from_env() -> Self {
         let condense_key = std::env::var("CONDENSE_API_KEY").ok().filter(|k| !k.is_empty());
-        let default_base = if condense_key.is_some() {
-            "https://api.condense.chat/openai/v1"
+        let (default_base, default_model) = if condense_key.is_some() {
+            ("https://api.condense.chat/openai/v1", "google/gemini-3.8-flash")
         } else {
-            "https://api.openai.com/v1"
+            ("https://api.openai.com/v1", "gpt-4o-mini")
         };
         Self {
             base_url: std::env::var("OPENAI_BASE_URL")
                 .unwrap_or_else(|_| default_base.into())
                 .trim_end_matches('/')
                 .to_string(),
-            api_key: std::env::var("OPENAI_API_KEY").ok().filter(|k| !k.is_empty()),
-            model: std::env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4o-mini".into()),
+            api_key: std::env::var("OPENAI_API_KEY")
+                .ok()
+                .filter(|k| !k.is_empty())
+                .or_else(|| condense_key.clone()),
+            model: std::env::var("OPENAI_MODEL").unwrap_or_else(|_| default_model.into()),
             condense_key,
         }
     }
@@ -39,6 +43,8 @@ pub struct ToolCallRequest {
     pub id: String,
     pub name: String,
     pub arguments: String,
+    /// Provider extras that must be echoed back (e.g. Gemini's `thought_signature`).
+    pub extra_content: Option<Value>,
 }
 
 #[derive(Debug, Default)]
@@ -57,11 +63,15 @@ impl Completion {
                 .tool_calls
                 .iter()
                 .map(|tc| {
-                    json!({
+                    let mut call = json!({
                         "id": tc.id,
                         "type": "function",
                         "function": { "name": tc.name, "arguments": tc.arguments },
-                    })
+                    });
+                    if let Some(extra) = &tc.extra_content {
+                        call["extra_content"] = extra.clone();
+                    }
+                    call
                 })
                 .collect();
         }
@@ -104,6 +114,7 @@ struct ToolCallDelta {
     index: usize,
     id: Option<String>,
     function: Option<FunctionDelta>,
+    extra_content: Option<Value>,
 }
 
 #[derive(Deserialize)]
@@ -202,6 +213,9 @@ impl LlmClient {
                         let slot = &mut out.tool_calls[tc.index];
                         if let Some(id) = tc.id {
                             slot.id = id;
+                        }
+                        if tc.extra_content.is_some() {
+                            slot.extra_content = tc.extra_content;
                         }
                         if let Some(f) = tc.function {
                             if let Some(n) = f.name {
