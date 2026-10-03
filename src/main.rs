@@ -36,6 +36,8 @@ const MODEL_CONFIG_ID: &str = "model";
 
 struct Session {
     cwd: PathBuf,
+    /// Additional workspace roots (from `NewSessionRequest::additional_directories`).
+    roots: Vec<PathBuf>,
     model: String,
     messages: Vec<Value>,
     cancel: CancellationToken,
@@ -53,10 +55,29 @@ struct CoderAgent {
 }
 
 impl CoderAgent {
-    fn system_prompt(&self, cwd: &std::path::Path) -> String {
+    fn system_prompt(&self, cwd: &std::path::Path, roots: &[PathBuf]) -> String {
+        let mut extra: Vec<&PathBuf> = roots.iter().filter(|r| **r != cwd).collect();
+        extra.sort();
+        extra.dedup();
+        let roots_section = if extra.is_empty() {
+            String::new()
+        } else {
+            let list = extra
+                .iter()
+                .map(|r| format!("- {}", r.display()))
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!(
+                "\nAdditional workspace roots the user has opened alongside the working directory:\n\
+                 {list}\n\
+                 You may read, edit and run commands in them too: pass a root's absolute path as \
+                 the `root` parameter of a tool (relative `path` arguments then resolve against \
+                 that root instead of the working directory)."
+            )
+        };
         format!(
             "You are onde-code, an autonomous coding agent working inside the user's editor.\n\
-             Working directory: {}\n\
+             Working directory: {}{roots_section}\n\
              Use the tools to inspect and modify the project: read files before editing, prefer \
              edit_file for small changes, and run commands to build or test your work. Keep \
              answers concise and use Markdown.\n\
@@ -144,14 +165,17 @@ impl CoderAgent {
         ))
     }
 
-    async fn new_session(&self, cwd: PathBuf) -> NewSessionResponse {
+    async fn new_session(&self, cwd: PathBuf, roots: Vec<PathBuf>) -> NewSessionResponse {
         let id = SessionId::new(uuid::Uuid::new_v4().to_string());
         let model = self.llm.model().to_string();
         let options = self.config_options(&model).await;
         let session = Session {
-            messages: vec![json!({ "role": "system", "content": self.system_prompt(&cwd) })],
+            messages: vec![
+                json!({ "role": "system", "content": self.system_prompt(&cwd, &roots) }),
+            ],
             model,
             cwd,
+            roots,
             cancel: CancellationToken::new(),
             always_allowed: Arc::default(),
         };
@@ -186,7 +210,7 @@ impl CoderAgent {
     ) -> anyhow::Result<StopReason> {
         let session_id = request.session_id.clone();
         // Take the history out while the turn runs; it's put back at the end.
-        let (cwd, model, mut messages, cancel, always_allowed) = {
+        let (cwd, roots, model, mut messages, cancel, always_allowed) = {
             let mut sessions = self.sessions.lock().unwrap();
             let s = sessions
                 .get_mut(&session_id)
@@ -194,6 +218,7 @@ impl CoderAgent {
             s.cancel = CancellationToken::new();
             (
                 s.cwd.clone(),
+                s.roots.clone(),
                 s.model.clone(),
                 std::mem::take(&mut s.messages),
                 s.cancel.clone(),
@@ -206,6 +231,7 @@ impl CoderAgent {
             connection: connection.clone(),
             session_id: session_id.clone(),
             cwd: cwd.clone(),
+            roots,
             caps: self.client_caps.lock().unwrap().clone(),
             cancel: cancel.clone(),
             yolo: self.yolo,
@@ -319,12 +345,13 @@ fn prompt_to_text(blocks: &[ContentBlock]) -> String {
 }
 
 const USAGE: &str = "\
-Usage: onde-code [--acp] [--yolo] [--list-models]
+Usage: onde-code [--acp] [--yolo] [--list-models] [--root <path>...]
 
   (no args)      interactive terminal UI (when run from a terminal)
   --acp          speak ACP over stdio for an editor (default when stdin is not a terminal)
   --yolo         approve file edits and commands without asking
   --list-models  list the models the configured endpoint serves, then exit
+  --root <path>  add an extra workspace root (repeatable; TUI mode only)
 ";
 
 #[tokio::main]
@@ -335,18 +362,41 @@ async fn main() -> anyhow::Result<()> {
         print!("{USAGE}");
         return Ok(());
     }
-    if let Some(bad) = args
-        .iter()
-        .find(|a| !["--acp", "--yolo", "--list-models"].contains(&a.as_str()))
-    {
-        anyhow::bail!("unknown argument {bad}\n\n{USAGE}");
+    // Collect `--root <path>` pairs; validate everything else is a known flag.
+    let mut roots: Vec<PathBuf> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--root" => {
+                i += 1;
+                let Some(path) = args.get(i) else {
+                    anyhow::bail!("--root requires a path\n\n{USAGE}");
+                };
+                let path = PathBuf::from(path);
+                let path = if path.is_absolute() {
+                    path
+                } else {
+                    std::env::current_dir()?.join(path)
+                };
+                if !path.is_dir() {
+                    anyhow::bail!("--root {} is not a directory", path.display());
+                }
+                roots.push(path);
+            }
+            "--acp" | "--yolo" | "--list-models" => {}
+            bad => anyhow::bail!("unknown argument {bad}\n\n{USAGE}"),
+        }
+        i += 1;
     }
     if has("--list-models") {
         list_models().await?;
     } else if has("--acp") || !std::io::stdin().is_terminal() {
+        if !roots.is_empty() {
+            anyhow::bail!("--root is only supported in the interactive TUI\n\n{USAGE}");
+        }
         run_agent(has("--yolo")).await?;
     } else {
-        tui::run(has("--yolo")).await?;
+        tui::run(has("--yolo"), roots).await?;
     }
     Ok(())
 }
@@ -406,7 +456,10 @@ async fn run_agent(yolo_flag: bool) -> agent_client_protocol::Result<()> {
                 async move |req: NewSessionRequest, responder, cx| {
                     // Listing models is a network call; keep it off the dispatch loop.
                     let agent = agent.clone();
-                    cx.spawn(async move { responder.respond(agent.new_session(req.cwd).await) })
+                    cx.spawn(async move {
+                        responder
+                            .respond(agent.new_session(req.cwd, req.additional_directories).await)
+                    })
                 }
             },
             agent_client_protocol::on_receive_request!(),

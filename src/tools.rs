@@ -3,7 +3,7 @@
 //! advertises support, and fall back to the local filesystem/process otherwise.
 
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -11,8 +11,8 @@ use agent_client_protocol::schema::v1::{
     ClientCapabilities, CreateTerminalRequest, Diff, KillTerminalRequest, PermissionOption,
     PermissionOptionKind, ReadTextFileRequest, ReleaseTerminalRequest, RequestPermissionOutcome,
     RequestPermissionRequest, SessionId, SessionNotification, SessionUpdate, Terminal,
-    TerminalOutputRequest, ToolCallContent, ToolCallLocation, ToolCallUpdate,
-    ToolCallUpdateFields, ToolKind, WaitForTerminalExitRequest, WriteTextFileRequest,
+    TerminalOutputRequest, ToolCallContent, ToolCallLocation, ToolCallUpdate, ToolCallUpdateFields,
+    ToolKind, WaitForTerminalExitRequest, WriteTextFileRequest,
 };
 use agent_client_protocol::{Client, ConnectionTo};
 use anyhow::{Context, Result, anyhow, bail};
@@ -27,7 +27,10 @@ const COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
 pub struct ToolCtx {
     pub connection: ConnectionTo<Client>,
     pub session_id: SessionId,
+    /// Primary working directory: the base for relative paths and `run_command`.
     pub cwd: PathBuf,
+    /// Additional workspace roots the model may address with the `root` parameter.
+    pub roots: Vec<PathBuf>,
     pub caps: ClientCapabilities,
     pub cancel: CancellationToken,
     pub yolo: bool,
@@ -46,59 +49,109 @@ pub struct ToolOutcome {
 impl ToolOutcome {
     fn ok(text: impl Into<String>) -> Self {
         let text = text.into();
-        Self { content: vec![ToolCallContent::from(text.clone())], text, failed: false }
+        Self {
+            content: vec![ToolCallContent::from(text.clone())],
+            text,
+            failed: false,
+        }
     }
     pub fn err(text: impl Into<String>) -> Self {
         let text = text.into();
-        Self { content: vec![ToolCallContent::from(text.clone())], text, failed: true }
+        Self {
+            content: vec![ToolCallContent::from(text.clone())],
+            text,
+            failed: true,
+        }
     }
 }
 
 pub fn definitions() -> Value {
-    let f = |name: &str, desc: &str, params: Value| {
-        json!({ "type": "function", "function": { "name": name, "description": desc, "parameters": params } })
+    let f = |name: &str, desc: &str, params: Value| json!({ "type": "function", "function": { "name": name, "description": desc, "parameters": params } });
+    let root_prop = || {
+        json!({
+            "type": "string",
+            "description": "Workspace root to act in: absolute path of one of the session roots. Defaults to the primary working directory."
+        })
     };
     json!([
-        f("read_file", "Read a text file. Paths may be relative to the working directory.", json!({
-            "type": "object",
-            "properties": {
-                "path": { "type": "string" },
-                "line": { "type": "integer", "description": "1-based line to start from" },
-                "limit": { "type": "integer", "description": "Max lines to read" }
-            },
-            "required": ["path"]
-        })),
-        f("write_file", "Create or overwrite a file with the given content.", json!({
-            "type": "object",
-            "properties": { "path": { "type": "string" }, "content": { "type": "string" } },
-            "required": ["path", "content"]
-        })),
-        f("edit_file", "Replace an exact, unique occurrence of old_string with new_string in a file.", json!({
-            "type": "object",
-            "properties": {
-                "path": { "type": "string" },
-                "old_string": { "type": "string" },
-                "new_string": { "type": "string" }
-            },
-            "required": ["path", "old_string", "new_string"]
-        })),
-        f("list_directory", "List entries of a directory (directories end with '/').", json!({
-            "type": "object",
-            "properties": { "path": { "type": "string", "description": "Defaults to the working directory" } }
-        })),
-        f("run_command", "Run a shell command (sh -c) in the working directory and return its output.", json!({
-            "type": "object",
-            "properties": { "command": { "type": "string" } },
-            "required": ["command"]
-        })),
+        f(
+            "read_file",
+            "Read a text file. Paths may be relative to the working directory.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string" },
+                    "line": { "type": "integer", "description": "1-based line to start from" },
+                    "limit": { "type": "integer", "description": "Max lines to read" },
+                    "root": root_prop()
+                },
+                "required": ["path"]
+            })
+        ),
+        f(
+            "write_file",
+            "Create or overwrite a file with the given content.",
+            json!({
+                "type": "object",
+                "properties": { "path": { "type": "string" }, "content": { "type": "string" }, "root": root_prop() },
+                "required": ["path", "content"]
+            })
+        ),
+        f(
+            "edit_file",
+            "Replace an exact, unique occurrence of old_string with new_string in a file.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string" },
+                    "old_string": { "type": "string" },
+                    "new_string": { "type": "string" },
+                    "root": root_prop()
+                },
+                "required": ["path", "old_string", "new_string"]
+            })
+        ),
+        f(
+            "list_directory",
+            "List entries of a directory (directories end with '/').",
+            json!({
+                "type": "object",
+                "properties": { "path": { "type": "string", "description": "Defaults to the working directory" }, "root": root_prop() }
+            })
+        ),
+        f(
+            "run_command",
+            "Run a shell command (sh -c) in the working directory and return its output.",
+            json!({
+                "type": "object",
+                "properties": { "command": { "type": "string" }, "root": root_prop() },
+                "required": ["command"]
+            })
+        ),
     ])
 }
 
 /// Title, kind and affected locations shown in the client when the call starts.
-pub fn describe(ctx: &ToolCtx, name: &str, args: &Value) -> (String, ToolKind, Vec<ToolCallLocation>) {
-    let path = args.get("path").and_then(Value::as_str).map(|p| ctx.resolve(p));
-    let loc = path.clone().map(ToolCallLocation::new).into_iter().collect();
-    let shown = path.as_deref().map_or_else(|| ctx.cwd.display().to_string(), |p| p.display().to_string());
+pub fn describe(
+    ctx: &ToolCtx,
+    name: &str,
+    args: &Value,
+) -> (String, ToolKind, Vec<ToolCallLocation>) {
+    let base = ctx
+        .base_for(args.get("root").and_then(Value::as_str))
+        .unwrap_or_else(|_| ctx.cwd.clone());
+    let path = args
+        .get("path")
+        .and_then(Value::as_str)
+        .map(|p| resolve_in(&base, p));
+    let loc = path
+        .clone()
+        .map(ToolCallLocation::new)
+        .into_iter()
+        .collect();
+    let shown = path
+        .as_deref()
+        .map_or_else(|| base.display().to_string(), |p| p.display().to_string());
     match name {
         "read_file" => (format!("Read {shown}"), ToolKind::Read, loc),
         "write_file" => (format!("Write {shown}"), ToolKind::Edit, loc),
@@ -106,7 +159,12 @@ pub fn describe(ctx: &ToolCtx, name: &str, args: &Value) -> (String, ToolKind, V
         "list_directory" => (format!("List {shown}"), ToolKind::Search, loc),
         "run_command" => {
             let cmd = args.get("command").and_then(Value::as_str).unwrap_or("");
-            (format!("`{cmd}`"), ToolKind::Execute, vec![])
+            let where_ = if base == ctx.cwd {
+                String::new()
+            } else {
+                format!(" in {}", base.display())
+            };
+            (format!("`{cmd}`{where_}"), ToolKind::Execute, vec![])
         }
         _ => (name.to_string(), ToolKind::Other, vec![]),
     }
@@ -129,36 +187,79 @@ struct ReadArgs {
     path: String,
     line: Option<u32>,
     limit: Option<u32>,
+    root: Option<String>,
 }
 #[derive(Deserialize)]
 struct WriteArgs {
     path: String,
     content: String,
+    root: Option<String>,
 }
 #[derive(Deserialize)]
 struct EditArgs {
     path: String,
     old_string: String,
     new_string: String,
+    root: Option<String>,
 }
 #[derive(Deserialize)]
 struct ListArgs {
     path: Option<String>,
+    root: Option<String>,
 }
 #[derive(Deserialize)]
 struct CommandArgs {
     command: String,
+    root: Option<String>,
 }
 
 impl ToolCtx {
-    fn resolve(&self, path: &str) -> PathBuf {
-        let p = Path::new(path);
-        if p.is_absolute() { p.to_path_buf() } else { self.cwd.join(p) }
+    /// All workspace roots, primary working directory first.
+    pub fn all_roots(&self) -> Vec<PathBuf> {
+        std::iter::once(self.cwd.clone())
+            .chain(self.roots.iter().filter(|r| **r != self.cwd).cloned())
+            .collect()
+    }
+
+    /// The base directory for a tool call's `root` parameter: an exact workspace root or a
+    /// direct child of one (so the model can pass e.g. a crate dir inside a root).
+    fn base_for(&self, root: Option<&str>) -> Result<PathBuf> {
+        let Some(root) = root else {
+            return Ok(self.cwd.clone());
+        };
+        let candidate = PathBuf::from(root);
+        for ws_root in self.all_roots() {
+            if candidate == ws_root {
+                return Ok(ws_root);
+            }
+            if let Ok(rest) = candidate.strip_prefix(&ws_root) {
+                // Allow exactly one directory level below a root.
+                if rest.components().count() == 1
+                    && matches!(rest.components().next(), Some(Component::Normal(_)))
+                {
+                    return Ok(candidate);
+                }
+            }
+        }
+        let known = self
+            .all_roots()
+            .iter()
+            .map(|r| r.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        bail!(
+            "unknown root `{}` (workspace roots: {known})",
+            candidate.display()
+        )
+    }
+
+    fn resolve_with(&self, root: Option<&str>, path: &str) -> Result<PathBuf> {
+        Ok(resolve_in(&self.base_for(root)?, path))
     }
 
     async fn read_file(&self, args: Value) -> Result<ToolOutcome> {
         let a: ReadArgs = serde_json::from_value(args)?;
-        let path = self.resolve(&a.path);
+        let path = self.resolve_with(a.root.as_deref(), &a.path)?;
         let text = if self.caps.fs.read_text_file {
             let mut req = ReadTextFileRequest::new(self.session_id.clone(), path.clone());
             if let Some(l) = a.line {
@@ -167,14 +268,22 @@ impl ToolCtx {
             if let Some(l) = a.limit {
                 req = req.limit(l);
             }
-            self.connection.send_request(req).block_task().await?.content
+            self.connection
+                .send_request(req)
+                .block_task()
+                .await?
+                .content
         } else {
             let full = tokio::fs::read_to_string(&path)
                 .await
                 .with_context(|| format!("reading {}", path.display()))?;
             let skip = a.line.map_or(0, |l| l.saturating_sub(1) as usize);
             let take = a.limit.map_or(usize::MAX, |l| l as usize);
-            full.lines().skip(skip).take(take).collect::<Vec<_>>().join("\n")
+            full.lines()
+                .skip(skip)
+                .take(take)
+                .collect::<Vec<_>>()
+                .join("\n")
         };
         // Show the user a short summary; give the model the full text.
         let mut out = ToolOutcome::ok(format!("{} lines", text.lines().count()));
@@ -186,7 +295,12 @@ impl ToolCtx {
     async fn read_existing(&self, path: &Path) -> Option<String> {
         if self.caps.fs.read_text_file {
             let req = ReadTextFileRequest::new(self.session_id.clone(), path.to_path_buf());
-            self.connection.send_request(req).block_task().await.ok().map(|r| r.content)
+            self.connection
+                .send_request(req)
+                .block_task()
+                .await
+                .ok()
+                .map(|r| r.content)
         } else {
             tokio::fs::read_to_string(path).await.ok()
         }
@@ -194,7 +308,8 @@ impl ToolCtx {
 
     async fn write_text(&self, path: &Path, content: &str) -> Result<()> {
         if self.caps.fs.write_text_file {
-            let req = WriteTextFileRequest::new(self.session_id.clone(), path.to_path_buf(), content);
+            let req =
+                WriteTextFileRequest::new(self.session_id.clone(), path.to_path_buf(), content);
             self.connection.send_request(req).block_task().await?;
         } else {
             if let Some(parent) = path.parent() {
@@ -207,15 +322,16 @@ impl ToolCtx {
 
     async fn write_file(&self, id: &str, args: Value) -> Result<ToolOutcome> {
         let a: WriteArgs = serde_json::from_value(args)?;
-        let path = self.resolve(&a.path);
+        let path = self.resolve_with(a.root.as_deref(), &a.path)?;
         let old = self.read_existing(&path).await;
         let diff = Diff::new(path.clone(), a.content.clone()).old_text(old);
-        self.apply_edit(id, "write_file", &path, &a.content, diff).await
+        self.apply_edit(id, "write_file", &path, &a.content, diff)
+            .await
     }
 
     async fn edit_file(&self, id: &str, args: Value) -> Result<ToolOutcome> {
         let a: EditArgs = serde_json::from_value(args)?;
-        let path = self.resolve(&a.path);
+        let path = self.resolve_with(a.root.as_deref(), &a.path)?;
         let old = self
             .read_existing(&path)
             .await
@@ -223,25 +339,42 @@ impl ToolCtx {
         match old.matches(&a.old_string).count() {
             0 => bail!("old_string not found in {}", path.display()),
             1 => {}
-            n => bail!("old_string occurs {n} times in {}; make it unique", path.display()),
+            n => bail!(
+                "old_string occurs {n} times in {}; make it unique",
+                path.display()
+            ),
         }
         let new = old.replacen(&a.old_string, &a.new_string, 1);
         let diff = Diff::new(path.clone(), new.clone()).old_text(old);
         self.apply_edit(id, "edit_file", &path, &new, diff).await
     }
 
-    async fn apply_edit(&self, id: &str, tool: &str, path: &Path, content: &str, diff: Diff) -> Result<ToolOutcome> {
+    async fn apply_edit(
+        &self,
+        id: &str,
+        tool: &str,
+        path: &Path,
+        content: &str,
+        diff: Diff,
+    ) -> Result<ToolOutcome> {
         let diff = ToolCallContent::from(diff);
         if !self.permit(id, tool, vec![diff.clone()]).await? {
             return Ok(ToolOutcome::err("User rejected this change."));
         }
         self.write_text(path, content).await?;
-        Ok(ToolOutcome { text: format!("Wrote {}", path.display()), content: vec![diff], failed: false })
+        Ok(ToolOutcome {
+            text: format!("Wrote {}", path.display()),
+            content: vec![diff],
+            failed: false,
+        })
     }
 
     async fn list_directory(&self, args: Value) -> Result<ToolOutcome> {
         let a: ListArgs = serde_json::from_value(args)?;
-        let path = a.path.map_or_else(|| self.cwd.clone(), |p| self.resolve(&p));
+        let base = self.base_for(a.root.as_deref())?;
+        let path = a
+            .path
+            .map_or_else(|| base.clone(), |p| resolve_in(&base, &p));
         let mut entries = Vec::new();
         let mut rd = tokio::fs::read_dir(&path)
             .await
@@ -259,26 +392,46 @@ impl ToolCtx {
 
     async fn run_command(&self, id: &str, args: Value) -> Result<ToolOutcome> {
         let a: CommandArgs = serde_json::from_value(args)?;
+        let base = self.base_for(a.root.as_deref())?;
         if !self.permit(id, "run_command", vec![]).await? {
             return Ok(ToolOutcome::err("User rejected running this command."));
         }
-        if self.caps.terminal { self.run_in_client_terminal(id, &a.command).await } else { self.run_locally(&a.command).await }
+        if self.caps.terminal {
+            self.run_in_client_terminal(id, &a.command, &base).await
+        } else {
+            self.run_locally(&a.command, &base).await
+        }
     }
 
-    async fn run_in_client_terminal(&self, id: &str, command: &str) -> Result<ToolOutcome> {
+    async fn run_in_client_terminal(
+        &self,
+        id: &str,
+        command: &str,
+        cwd: &Path,
+    ) -> Result<ToolOutcome> {
         let sid = self.session_id.clone();
         let req = CreateTerminalRequest::new(sid.clone(), "sh")
             .args(vec!["-c".into(), command.into()])
-            .cwd(self.cwd.clone())
+            .cwd(cwd.to_path_buf())
             .output_byte_limit(MAX_OUTPUT_BYTES as u64);
-        let terminal_id = self.connection.send_request(req).block_task().await?.terminal_id;
+        let terminal_id = self
+            .connection
+            .send_request(req)
+            .block_task()
+            .await?
+            .terminal_id;
         // Embed the live terminal in the tool call so the user can watch it.
-        let content = vec![ToolCallContent::Terminal(Terminal::new(terminal_id.clone()))];
+        let content = vec![ToolCallContent::Terminal(Terminal::new(
+            terminal_id.clone(),
+        ))];
         self.update(id, ToolCallUpdateFields::new().content(content.clone()))?;
 
         let wait = self
             .connection
-            .send_request(WaitForTerminalExitRequest::new(sid.clone(), terminal_id.clone()))
+            .send_request(WaitForTerminalExitRequest::new(
+                sid.clone(),
+                terminal_id.clone(),
+            ))
             .block_task();
         let exit = tokio::select! {
             r = wait => Some(r?.exit_status),
@@ -286,14 +439,22 @@ impl ToolCtx {
             () = self.cancel.cancelled() => None,
         };
         if exit.is_none() {
-            let _ = self.connection.send_request(KillTerminalRequest::new(sid.clone(), terminal_id.clone())).block_task().await;
+            let _ = self
+                .connection
+                .send_request(KillTerminalRequest::new(sid.clone(), terminal_id.clone()))
+                .block_task()
+                .await;
         }
         let output = self
             .connection
             .send_request(TerminalOutputRequest::new(sid.clone(), terminal_id.clone()))
             .block_task()
             .await?;
-        let _ = self.connection.send_request(ReleaseTerminalRequest::new(sid, terminal_id)).block_task().await;
+        let _ = self
+            .connection
+            .send_request(ReleaseTerminalRequest::new(sid, terminal_id))
+            .block_task()
+            .await;
 
         let status = match &exit {
             Some(s) => match (s.exit_code, &s.signal) {
@@ -305,15 +466,23 @@ impl ToolCtx {
             None => format!("timed out after {}s", COMMAND_TIMEOUT.as_secs()),
         };
         let failed = !matches!(exit.as_ref().and_then(|s| s.exit_code), Some(0));
-        let trunc = if output.truncated { "\n[output truncated]" } else { "" };
-        Ok(ToolOutcome { text: format!("{}{trunc}\n[{status}]", output.output), content, failed })
+        let trunc = if output.truncated {
+            "\n[output truncated]"
+        } else {
+            ""
+        };
+        Ok(ToolOutcome {
+            text: format!("{}{trunc}\n[{status}]", output.output),
+            content,
+            failed,
+        })
     }
 
-    async fn run_locally(&self, command: &str) -> Result<ToolOutcome> {
+    async fn run_locally(&self, command: &str, cwd: &Path) -> Result<ToolOutcome> {
         let child = tokio::process::Command::new("sh")
             .arg("-c")
             .arg(command)
-            .current_dir(&self.cwd)
+            .current_dir(cwd)
             .stdin(std::process::Stdio::null())
             .kill_on_drop(true)
             .output();
@@ -326,7 +495,10 @@ impl ToolCtx {
         };
         let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
         text.push_str(&String::from_utf8_lossy(&out.stderr));
-        let status = out.status.code().map_or_else(|| "killed by signal".into(), |c| format!("exit code {c}"));
+        let status = out
+            .status
+            .code()
+            .map_or_else(|| "killed by signal".into(), |c| format!("exit code {c}"));
         let text = format!("{}\n[{status}]", truncate(text));
         let mut outcome = ToolOutcome::ok(format!("```\n{text}\n```"));
         outcome.text = text;
@@ -348,7 +520,11 @@ impl ToolCtx {
             ToolCallUpdate::new(id.to_string(), fields),
             vec![
                 PermissionOption::new("allow_once", "Allow", PermissionOptionKind::AllowOnce),
-                PermissionOption::new("allow_always", "Always allow", PermissionOptionKind::AllowAlways),
+                PermissionOption::new(
+                    "allow_always",
+                    "Always allow",
+                    PermissionOptionKind::AllowAlways,
+                ),
                 PermissionOption::new("reject_once", "Reject", PermissionOptionKind::RejectOnce),
             ],
         );
@@ -371,8 +547,19 @@ impl ToolCtx {
 
     pub fn update(&self, id: &str, fields: ToolCallUpdateFields) -> Result<()> {
         let update = SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(id.to_string(), fields));
-        self.connection.send_notification(SessionNotification::new(self.session_id.clone(), update))?;
+        self.connection
+            .send_notification(SessionNotification::new(self.session_id.clone(), update))?;
         Ok(())
+    }
+}
+
+/// Join `path` onto `base`, keeping absolute paths as-is.
+fn resolve_in(base: &Path, path: &str) -> PathBuf {
+    let p = Path::new(path);
+    if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        base.join(p)
     }
 }
 

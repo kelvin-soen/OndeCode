@@ -2,7 +2,7 @@
 //! agent subprocess and renders the session with ratatui, so it exercises exactly the protocol
 //! path an editor would.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use agent_client_protocol::schema::ProtocolVersion;
@@ -27,11 +27,14 @@ const MAX_TOOL_OUTPUT_LINES: usize = 8;
 
 enum AppEvent {
     Update(SessionUpdate),
-    Permission(RequestPermissionRequest, oneshot::Sender<RequestPermissionOutcome>),
+    Permission(
+        RequestPermissionRequest,
+        oneshot::Sender<RequestPermissionOutcome>,
+    ),
     TurnDone(Result<StopReason, String>),
 }
 
-pub async fn run(yolo: bool) -> anyhow::Result<()> {
+pub async fn run(yolo: bool, extra_roots: Vec<PathBuf>) -> anyhow::Result<()> {
     let mut config = AcpAgentConfig::new(std::env::current_exe()?).arg("--acp");
     if yolo {
         config = config.arg("--yolo");
@@ -61,22 +64,37 @@ pub async fn run(yolo: bool) -> anyhow::Result<()> {
                     let (answer_tx, answer_rx) = oneshot::channel();
                     let _ = tx.send(AppEvent::Permission(req, answer_tx));
                     cx.spawn(async move {
-                        let outcome = answer_rx.await.unwrap_or(RequestPermissionOutcome::Cancelled);
+                        let outcome = answer_rx
+                            .await
+                            .unwrap_or(RequestPermissionOutcome::Cancelled);
                         responder.respond(RequestPermissionResponse::new(outcome))
                     })
                 }
             },
             agent_client_protocol::on_receive_request!(),
         )
-        .connect_with(AcpAgent::new(config), |conn: ConnectionTo<Agent>| async move {
-            conn.send_request(InitializeRequest::new(ProtocolVersion::V1)).block_task().await?;
-            let session = conn.send_request(NewSessionRequest::new(cwd.clone())).block_task().await?;
-            let mut app = App::new(conn, session.session_id, tx, model, cwd);
-            let mut terminal = ratatui::init();
-            let result = app.run(&mut terminal, rx).await;
-            ratatui::restore();
-            result.map_err(|e| agent_client_protocol::Error::internal_error().data(format!("{e:#}")))
-        })
+        .connect_with(
+            AcpAgent::new(config),
+            |conn: ConnectionTo<Agent>| async move {
+                conn.send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                let session = conn
+                    .send_request(
+                        NewSessionRequest::new(cwd.clone())
+                            .additional_directories(extra_roots.clone()),
+                    )
+                    .block_task()
+                    .await?;
+                let mut app = App::new(conn, session.session_id, tx, model, cwd, extra_roots);
+                let mut terminal = ratatui::init();
+                let result = app.run(&mut terminal, rx).await;
+                ratatui::restore();
+                result.map_err(|e| {
+                    agent_client_protocol::Error::internal_error().data(format!("{e:#}"))
+                })
+            },
+        )
         .await?;
     Ok(())
 }
@@ -85,7 +103,12 @@ enum Entry {
     User(String),
     Agent(String),
     Thought(String),
-    Tool { id: ToolCallId, title: String, status: ToolCallStatus, output: String },
+    Tool {
+        id: ToolCallId,
+        title: String,
+        status: ToolCallStatus,
+        output: String,
+    },
     Info(String),
     Error(String),
 }
@@ -95,12 +118,16 @@ struct App {
     session_id: SessionId,
     tx: mpsc::UnboundedSender<AppEvent>,
     model: String,
-    cwd: PathBuf,
+    /// Workspace roots, primary working directory first, then any additional roots.
+    roots: Vec<PathBuf>,
     entries: Vec<Entry>,
     input: Vec<char>,
     cursor: usize,
     busy: bool,
-    permission: Option<(RequestPermissionRequest, oneshot::Sender<RequestPermissionOutcome>)>,
+    permission: Option<(
+        RequestPermissionRequest,
+        oneshot::Sender<RequestPermissionOutcome>,
+    )>,
     /// Lines scrolled up from the bottom of the transcript; 0 follows new output.
     scroll_up: usize,
     tick: usize,
@@ -114,14 +141,20 @@ impl App {
         tx: mpsc::UnboundedSender<AppEvent>,
         model: String,
         cwd: PathBuf,
+        extra_roots: Vec<PathBuf>,
     ) -> Self {
+        let roots = std::iter::once(cwd.clone())
+            .chain(extra_roots.into_iter().filter(|r| *r != cwd))
+            .collect();
         Self {
             conn,
             session_id,
             tx,
             model,
-            cwd,
-            entries: vec![Entry::Info("Ask for a change, or type /quit to exit.".into())],
+            roots,
+            entries: vec![Entry::Info(
+                "Ask for a change, or type /quit to exit.".into(),
+            )],
             input: Vec::new(),
             cursor: 0,
             busy: false,
@@ -163,8 +196,12 @@ impl App {
                 self.busy = false;
                 match result {
                     Ok(StopReason::EndTurn) => {}
-                    Ok(StopReason::Cancelled) => self.entries.push(Entry::Info("Cancelled.".into())),
-                    Ok(other) => self.entries.push(Entry::Info(format!("Stopped: {other:?}"))),
+                    Ok(StopReason::Cancelled) => {
+                        self.entries.push(Entry::Info("Cancelled.".into()))
+                    }
+                    Ok(other) => self
+                        .entries
+                        .push(Entry::Info(format!("Stopped: {other:?}"))),
                     Err(e) => self.entries.push(Entry::Error(e)),
                 }
             }
@@ -179,7 +216,9 @@ impl App {
             },
             SessionUpdate::AgentThoughtChunk(chunk) => match self.entries.last_mut() {
                 Some(Entry::Thought(text)) => text.push_str(&block_text(&chunk.content)),
-                _ => self.entries.push(Entry::Thought(block_text(&chunk.content))),
+                _ => self
+                    .entries
+                    .push(Entry::Thought(block_text(&chunk.content))),
             },
             SessionUpdate::ToolCall(call) => self.entries.push(Entry::Tool {
                 id: call.tool_call_id,
@@ -188,10 +227,17 @@ impl App {
                 output: summarize(&call.content),
             }),
             SessionUpdate::ToolCallUpdate(update) => {
-                let entry = self.entries.iter_mut().rev().find(
-                    |e| matches!(e, Entry::Tool { id, .. } if *id == update.tool_call_id),
-                );
-                if let Some(Entry::Tool { title, status, output, .. }) = entry {
+                let entry =
+                    self.entries.iter_mut().rev().find(
+                        |e| matches!(e, Entry::Tool { id, .. } if *id == update.tool_call_id),
+                    );
+                if let Some(Entry::Tool {
+                    title,
+                    status,
+                    output,
+                    ..
+                }) = entry
+                {
                     let fields = update.fields;
                     if let Some(s) = fields.status {
                         *status = s;
@@ -213,7 +259,9 @@ impl App {
         if self.permission.is_some() {
             match key.code {
                 KeyCode::Char('y') => self.answer_permission(Some(PermissionOptionKind::AllowOnce)),
-                KeyCode::Char('a') => self.answer_permission(Some(PermissionOptionKind::AllowAlways)),
+                KeyCode::Char('a') => {
+                    self.answer_permission(Some(PermissionOptionKind::AllowAlways))
+                }
                 KeyCode::Char('n') | KeyCode::Esc => {
                     self.answer_permission(Some(PermissionOptionKind::RejectOnce))
                 }
@@ -298,33 +346,55 @@ impl App {
         if let Some((_, answer)) = self.permission.take() {
             let _ = answer.send(RequestPermissionOutcome::Cancelled);
         }
-        if let Err(e) = self.conn.send_notification(CancelNotification::new(self.session_id.clone())) {
-            self.entries.push(Entry::Error(format!("cancel failed: {e}")));
+        if let Err(e) = self
+            .conn
+            .send_notification(CancelNotification::new(self.session_id.clone()))
+        {
+            self.entries
+                .push(Entry::Error(format!("cancel failed: {e}")));
         }
     }
 
     fn answer_permission(&mut self, kind: Option<PermissionOptionKind>) {
-        let Some((req, answer)) = self.permission.take() else { return };
+        let Some((req, answer)) = self.permission.take() else {
+            return;
+        };
         let outcome = req
             .options
             .iter()
             .find(|o| Some(o.kind) == kind)
-            .map(|o| RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(o.option_id.clone())))
+            .map(|o| {
+                RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(
+                    o.option_id.clone(),
+                ))
+            })
             .unwrap_or(RequestPermissionOutcome::Cancelled);
         let _ = answer.send(outcome);
     }
 
-    /// Show paths under the working directory relative to it.
+    /// Show paths under a workspace root relative to it; secondary roots get a `name/` prefix.
     fn short(&self, text: &str) -> String {
-        let mut prefix = self.cwd.display().to_string();
-        prefix.push('/');
-        text.replace(&prefix, "")
+        let mut out = text.to_string();
+        for (i, root) in self.roots.iter().enumerate() {
+            let mut prefix = root.display().to_string();
+            prefix.push('/');
+            let replacement = if i == 0 {
+                String::new()
+            } else {
+                root_name(root)
+            };
+            out = out.replace(&prefix, &replacement);
+        }
+        out
     }
 
     fn draw(&self, f: &mut Frame) {
-        let [body, input, status] =
-            Layout::vertical([Constraint::Min(1), Constraint::Length(3), Constraint::Length(1)])
-                .areas(f.area());
+        let [body, input, status] = Layout::vertical([
+            Constraint::Min(1),
+            Constraint::Length(3),
+            Constraint::Length(1),
+        ])
+        .areas(f.area());
         self.draw_transcript(f, body);
         self.draw_input(f, input);
         self.draw_status(f, status);
@@ -355,10 +425,21 @@ impl App {
                     lines.extend(text.trim().lines().map(|l| Line::from(l.to_string())));
                 }
                 Entry::Thought(text) => {
-                    let style = Style::new().fg(Color::DarkGray).add_modifier(Modifier::ITALIC);
-                    lines.extend(text.trim().lines().map(|l| Line::styled(format!("  {l}"), style)));
+                    let style = Style::new()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::ITALIC);
+                    lines.extend(
+                        text.trim()
+                            .lines()
+                            .map(|l| Line::styled(format!("  {l}"), style)),
+                    );
                 }
-                Entry::Tool { title, status, output, .. } => {
+                Entry::Tool {
+                    title,
+                    status,
+                    output,
+                    ..
+                } => {
                     let icon = match status {
                         ToolCallStatus::Completed => "✓".green(),
                         ToolCallStatus::Failed => "✗".red(),
@@ -371,7 +452,10 @@ impl App {
                         .filter(|l| !l.trim().is_empty() && !l.trim_start().starts_with("```"))
                         .collect();
                     for l in out.iter().take(MAX_TOOL_OUTPUT_LINES) {
-                        lines.push(Line::from(vec!["  │ ".dark_gray(), l.to_string().dark_gray()]));
+                        lines.push(Line::from(vec![
+                            "  │ ".dark_gray(),
+                            l.to_string().dark_gray(),
+                        ]));
                     }
                     if out.len() > MAX_TOOL_OUTPUT_LINES {
                         let more = out.len() - MAX_TOOL_OUTPUT_LINES;
@@ -388,11 +472,18 @@ impl App {
         let total = paragraph.line_count(area.width);
         let max_offset = total.saturating_sub(area.height as usize);
         let offset = max_offset.saturating_sub(self.scroll_up);
-        f.render_widget(paragraph.scroll((offset.min(u16::MAX as usize) as u16, 0)), area);
+        f.render_widget(
+            paragraph.scroll((offset.min(u16::MAX as usize) as u16, 0)),
+            area,
+        );
     }
 
     fn draw_input(&self, f: &mut Frame, area: Rect) {
-        let border = if self.busy { Color::DarkGray } else { Color::Cyan };
+        let border = if self.busy {
+            Color::DarkGray
+        } else {
+            Color::Cyan
+        };
         let block = Block::bordered()
             .border_type(BorderType::Rounded)
             .border_style(Style::new().fg(border))
@@ -421,14 +512,24 @@ impl App {
         } else {
             "ready".green()
         };
-        let hints = if self.busy { "Esc cancel" } else { "Enter send · Ctrl-C quit" };
+        let hints = if self.busy {
+            "Esc cancel"
+        } else {
+            "Enter send · Ctrl-C quit"
+        };
+        let roots = self
+            .roots
+            .iter()
+            .map(|r| r.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
         let line = Line::from(vec![
             " ".into(),
             state,
             " · ".dark_gray(),
             self.model.clone().cyan(),
             " · ".dark_gray(),
-            self.cwd.display().to_string().dark_gray(),
+            roots.dark_gray(),
             " · ".dark_gray(),
             hints.dark_gray(),
             " · ↑↓/PgUp/PgDn scroll".dark_gray(),
@@ -463,7 +564,18 @@ fn draw_permission(f: &mut Frame, title: &str) {
         ]),
     ];
     f.render_widget(Clear, popup);
-    f.render_widget(Paragraph::new(text).block(block).wrap(Wrap { trim: false }), popup);
+    f.render_widget(
+        Paragraph::new(text).block(block).wrap(Wrap { trim: false }),
+        popup,
+    );
+}
+
+/// Display name for a workspace root: its directory name with a trailing slash.
+fn root_name(root: &Path) -> String {
+    match root.file_name() {
+        Some(name) => format!("{}/", name.to_string_lossy()),
+        None => root.display().to_string(),
+    }
 }
 
 fn block_text(block: &ContentBlock) -> String {
@@ -481,7 +593,11 @@ fn summarize(content: &[ToolCallContent]) -> String {
             ToolCallContent::Content(c) => block_text(&c.content),
             ToolCallContent::Diff(d) => {
                 let old = d.old_text.as_deref().map_or(0, |t| t.lines().count());
-                format!("{} (-{old} +{} lines)", d.path.display(), d.new_text.lines().count())
+                format!(
+                    "{} (-{old} +{} lines)",
+                    d.path.display(),
+                    d.new_text.lines().count()
+                )
             }
             _ => String::new(),
         })
