@@ -464,6 +464,9 @@ fn prompt_to_content(blocks: &[ContentBlock]) -> Value {
                 let data_url = format!("data:{};base64,{}", img.mime_type, img.data);
                 parts.push(json!({ "type": "image_url", "image_url": { "url": data_url } }));
             }
+            ContentBlock::Audio(_) => {
+                parts.push(json!({ "type": "text", "text": "[Unsupported: audio content block]" }));
+            }
             _ => {}
         }
     }
