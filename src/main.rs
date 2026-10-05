@@ -17,14 +17,16 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use agent_client_protocol::schema::v1::{
     AgentCapabilities, AuthMethod, AuthMethodTerminal, CancelNotification, ClientCapabilities,
-    ContentBlock, ContentChunk, EmbeddedResourceResource, Implementation, InitializeRequest,
-    InitializeResponse, ListSessionsRequest, ListSessionsResponse, NewSessionRequest,
-    NewSessionResponse, PromptCapabilities, PromptRequest, PromptResponse,
-    SessionAdditionalDirectoriesCapabilities, SessionCapabilities, SessionConfigOption,
-    SessionConfigOptionCategory, SessionConfigSelectOption, SessionConfigSelectOptions, SessionId,
-    SessionInfo, SessionListCapabilities, SessionNotification, SessionUpdate,
-    SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, StopReason, ToolCall,
-    ToolCallStatus, ToolCallUpdateFields,
+    CloseSessionRequest, CloseSessionResponse, ContentBlock, ContentChunk,
+    EmbeddedResourceResource, Implementation, InitializeRequest, InitializeResponse,
+    ListSessionsRequest, ListSessionsResponse, LoadSessionRequest, LoadSessionResponse,
+    NewSessionRequest, NewSessionResponse, PromptCapabilities, PromptRequest, PromptResponse,
+    ResumeSessionRequest, ResumeSessionResponse, SessionAdditionalDirectoriesCapabilities,
+    SessionCapabilities, SessionCloseCapabilities, SessionConfigOption,
+    SessionConfigOptionCategory, SessionConfigSelectOption, SessionConfigSelectOptions,
+    SessionId, SessionInfo, SessionListCapabilities, SessionNotification,
+    SessionResumeCapabilities, SessionUpdate, SetSessionConfigOptionRequest,
+    SetSessionConfigOptionResponse, StopReason, ToolCall, ToolCallStatus, ToolCallUpdateFields,
 };
 use agent_client_protocol::{Agent, Client, ConnectionTo, Responder, Stdio};
 use anyhow::Context;
@@ -262,6 +264,116 @@ impl CoderAgent {
         if let Some(s) = self.sessions.lock().unwrap().get(session_id) {
             s.cancel.cancel();
         }
+    }
+
+    /// Replay a session's conversation history as `session/update` notifications, then
+    /// respond with config options. Called by `session/load`.
+    async fn load_session(
+        &self,
+        req: LoadSessionRequest,
+        connection: &ConnectionTo<Client>,
+    ) -> agent_client_protocol::Result<LoadSessionResponse> {
+        let session_id = req.session_id.clone();
+        let (model, messages) = {
+            let sessions = self.sessions.lock().unwrap();
+            let s = sessions
+                .get(&session_id)
+                .ok_or_else(|| agent_client_protocol::Error::invalid_params()
+                    .data(format!("unknown session {session_id}")))?;
+            (s.model.clone(), s.messages.clone())
+        };
+        let notify = |update: SessionUpdate| {
+            connection.send_notification(SessionNotification::new(session_id.clone(), update))
+        };
+        for msg in &messages {
+            let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("");
+            match role {
+                "user" => {
+                    let text = msg.get("content").and_then(|v| v.as_str()).unwrap_or("");
+                    notify(SessionUpdate::UserMessageChunk(ContentChunk::new(
+                        text.to_string().into(),
+                    )))?;
+                }
+                "assistant" => {
+                    let text = msg.get("content").and_then(|v| v.as_str()).unwrap_or("");
+                    if !text.is_empty() {
+                        notify(SessionUpdate::AgentMessageChunk(ContentChunk::new(
+                            text.to_string().into(),
+                        )))?;
+                    }
+                    // Replay tool calls attached to the assistant message.
+                    if let Some(tool_calls) = msg.get("tool_calls").and_then(|v| v.as_array()) {
+                        for tc in tool_calls {
+                            let id = tc
+                                .get("id")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("unknown")
+                                .to_string();
+                            let name = tc
+                                .pointer("/function/name")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("unknown")
+                                .to_string();
+                            let args_str = tc
+                                .pointer("/function/arguments")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("{}")
+                                .to_string();
+                            let args: Value =
+                                serde_json::from_str(&args_str).unwrap_or_else(|_| json!({}));
+                            notify(SessionUpdate::ToolCall(
+                                ToolCall::new(id, name.clone())
+                                    .status(ToolCallStatus::Completed)
+                                    .raw_input(args),
+                            ))?;
+                        }
+                    }
+                }
+                // system and tool messages are not replayed as session updates.
+                _ => {}
+            }
+        }
+        let options = self.config_options(&model).await;
+        Ok(LoadSessionResponse::new().config_options(options))
+    }
+
+    /// Rebind an existing session to a new cwd / additional directories without replaying
+    /// the conversation. Called by `session/resume`.
+    async fn resume_session(
+        &self,
+        req: ResumeSessionRequest,
+    ) -> agent_client_protocol::Result<ResumeSessionResponse> {
+        let session_id = req.session_id.clone();
+        let model = {
+            let mut sessions = self.sessions.lock().unwrap();
+            let s = sessions
+                .get_mut(&session_id)
+                .ok_or_else(|| agent_client_protocol::Error::invalid_params()
+                    .data(format!("unknown session {session_id}")))?;
+            s.cwd = req.cwd;
+            if !req.additional_directories.is_empty() {
+                s.roots = req.additional_directories;
+            }
+            s.updated_at = now_secs();
+            s.model.clone()
+        };
+        let options = self.config_options(&model).await;
+        Ok(ResumeSessionResponse::new().config_options(options))
+    }
+
+    /// Cancel any in-progress work and remove the session. Called by `session/close`.
+    fn close_session(&self, req: CloseSessionRequest) -> agent_client_protocol::Result<CloseSessionResponse> {
+        let session_id = req.session_id.clone();
+        let removed = self.sessions.lock().unwrap().remove(&session_id);
+        if removed.is_none() {
+            return Err(agent_client_protocol::Error::invalid_params()
+                .data(format!("unknown session {session_id}")));
+        }
+        // Cancel any pending work on the removed session.
+        if let Some(s) = removed {
+            s.cancel.cancel();
+        }
+        Ok(CloseSessionResponse::new())
     }
 
     async fn prompt(
@@ -659,8 +771,11 @@ async fn run_agent(yolo_flag: bool) -> agent_client_protocol::Result<()> {
                                             .list(SessionListCapabilities::new())
                                             .additional_directories(
                                                 SessionAdditionalDirectoriesCapabilities::new(),
-                                            ),
-                                    ),
+                                            )
+                                            .resume(SessionResumeCapabilities::new())
+                                            .close(SessionCloseCapabilities::new()),
+                                    )
+                                    .load_session(true),
                             )
                             .agent_info(Implementation::new(
                                 "onde-code",
@@ -693,6 +808,49 @@ async fn run_agent(yolo_flag: bool) -> agent_client_protocol::Result<()> {
                 let agent = agent.clone();
                 async move |req: ListSessionsRequest, responder, _cx| {
                     responder.respond(agent.list_sessions(req))
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let agent = agent.clone();
+                async move |req: LoadSessionRequest, responder, cx| {
+                    let agent = agent.clone();
+                    let connection = cx.clone();
+                    cx.spawn(async move {
+                        match agent.load_session(req, &connection).await {
+                            Ok(resp) => responder.respond(resp),
+                            Err(e) => responder.respond_with_error(e),
+                        }
+                    })
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let agent = agent.clone();
+                async move |req: ResumeSessionRequest, responder, cx| {
+                    let agent = agent.clone();
+                    cx.spawn(async move {
+                        match agent.resume_session(req).await {
+                            Ok(resp) => responder.respond(resp),
+                            Err(e) => responder.respond_with_error(e),
+                        }
+                    })
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let agent = agent.clone();
+                async move |req: CloseSessionRequest, responder, _cx| {
+                    match agent.close_session(req) {
+                        Ok(resp) => responder.respond(resp),
+                        Err(e) => responder.respond_with_error(e),
+                    }
                 }
             },
             agent_client_protocol::on_receive_request!(),
