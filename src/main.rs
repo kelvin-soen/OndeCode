@@ -139,7 +139,7 @@ impl CoderAgent {
              edit_file for small changes, and run commands to build or test your work. Keep \
              answers concise and use Markdown.\n\
              When creating git commits, include the trailer:\n\
-             Co-Authored-By: OndeCode v{version} -{surface} <noreply@ondeinference.com>",
+             Co-Authored-By: OndeCode v{version}-{surface} <noreply@ondeinference.com>",
             cwd.display(),
             version = env!("CARGO_PKG_VERSION"),
             surface = self.surface,
