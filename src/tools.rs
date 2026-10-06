@@ -36,6 +36,8 @@ pub struct ToolCtx {
     pub yolo: bool,
     /// Tool names the user chose "always allow" for in this session.
     pub always_allowed: Arc<Mutex<HashSet<String>>>,
+    /// Tool names the user chose "always reject" for in this session.
+    pub always_rejected: Arc<Mutex<HashSet<String>>>,
 }
 
 pub struct ToolOutcome {
@@ -521,6 +523,9 @@ impl ToolCtx {
 
     /// Ask the user for permission. Returns `Ok(false)` if rejected or cancelled.
     async fn permit(&self, id: &str, tool: &str, content: Vec<ToolCallContent>) -> Result<bool> {
+        if self.always_rejected.lock().unwrap().contains(tool) {
+            return Ok(false);
+        }
         if self.yolo || self.always_allowed.lock().unwrap().contains(tool) {
             return Ok(true);
         }
@@ -539,6 +544,11 @@ impl ToolCtx {
                     PermissionOptionKind::AllowAlways,
                 ),
                 PermissionOption::new("reject_once", "Reject", PermissionOptionKind::RejectOnce),
+                PermissionOption::new(
+                    "reject_always",
+                    "Always reject",
+                    PermissionOptionKind::RejectAlways,
+                ),
             ],
         );
         let resp = tokio::select! {
@@ -552,6 +562,10 @@ impl ToolCtx {
                     true
                 }
                 "allow_once" => true,
+                "reject_always" => {
+                    self.always_rejected.lock().unwrap().insert(tool.to_string());
+                    false
+                }
                 _ => false,
             },
             _ => false,

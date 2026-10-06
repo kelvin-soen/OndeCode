@@ -13,11 +13,14 @@ use std::io::IsTerminal;
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use agent_client_protocol::schema::v1::{
-    AgentCapabilities, AuthMethod, AuthMethodTerminal, CancelNotification, ClientCapabilities,
+    AgentAuthCapabilities, AgentCapabilities, AuthMethod, AuthMethodTerminal, AuthenticateRequest,
+    AuthenticateResponse, DeleteSessionRequest, DeleteSessionResponse, EmbeddedResource,
+    LogoutCapabilities, LogoutRequest, LogoutResponse, MessageId, SessionDeleteCapabilities,
+    ReadTextFileRequest, TextResourceContents, UsageUpdate, CancelNotification, ClientCapabilities,
     CloseSessionRequest, CloseSessionResponse, ContentBlock, ContentChunk,
     EmbeddedResourceResource, Implementation, InitializeRequest, InitializeResponse,
     ListSessionsRequest, ListSessionsResponse, LoadSessionRequest, LoadSessionResponse, McpServer,
@@ -41,10 +44,15 @@ const MAX_TURNS: usize = 50;
 /// Id of the session config option that selects the model.
 const MODEL_CONFIG_ID: &str = "model";
 
+/// Context window reported in `usage_update` when ONDE_CODE_CONTEXT_WINDOW is unset.
+const DEFAULT_CONTEXT_WINDOW: u64 = 128_000;
+
+const AUTH_METHOD_ID: &str = "terminal-setup";
+
 /// The terminal auth method advertised on initialize: clients run `onde-code --setup`.
 fn auth_methods() -> Vec<AuthMethod> {
     vec![AuthMethod::Terminal(
-        AuthMethodTerminal::new("terminal-setup", "Run in terminal")
+        AuthMethodTerminal::new(AUTH_METHOD_ID, "Run in terminal")
             .description("Interactive setup: choose a provider and store an API key")
             .args(vec!["--setup".into()]),
     )]
@@ -65,6 +73,7 @@ struct Session {
     always_allowed: Arc<Mutex<HashSet<String>>>,
     /// Connected MCP servers for this session (stdio transport).
     mcp: Arc<tokio::sync::Mutex<mcp::McpRegistry>>,
+    always_rejected: Arc<Mutex<HashSet<String>>>,
     /// Human-readable title shown by `session/list`: the first user prompt.
     title: Option<String>,
     /// Last activity, seconds since the Unix epoch (reported by `session/list`).
@@ -104,14 +113,16 @@ fn iso8601(secs: u64) -> String {
 
 #[derive(Clone)]
 struct CoderAgent {
-    llm: LlmClient,
+    /// Reloaded after `authenticate` / `logout`, since `--setup` rewrites the stored key.
+    llm: Arc<RwLock<LlmClient>>,
     yolo: bool,
     /// How the agent was launched: `tui` (interactive terminal UI) or `acp` (editor).
     surface: &'static str,
     client_caps: Arc<Mutex<ClientCapabilities>>,
     sessions: Arc<Mutex<HashMap<SessionId, Session>>>,
     /// Models offered for selection, fetched from `GET /models` on first use.
-    models: Arc<tokio::sync::OnceCell<Vec<String>>>,
+    /// Cached model list; cleared when credentials change.
+    models: Arc<tokio::sync::Mutex<Option<Vec<String>>>>,
 }
 
 impl CoderAgent {
@@ -151,10 +162,15 @@ impl CoderAgent {
 
     /// The selectable models. Falls back to just the configured model if the endpoint
     /// can't list them; the configured model is always offered.
-    async fn models(&self) -> &[String] {
-        self.models
-            .get_or_init(|| async {
-                let default = self.llm.model().to_string();
+    async fn models(&self) -> Vec<String> {
+        let mut cache = self.models.lock().await;
+        if let Some(ids) = &*cache {
+            return ids.clone();
+        }
+        let llm = self.llm();
+        let ids = {
+            {
+                let default = llm.model().to_string();
                 // An explicit list wins: some endpoints (Condense) can't list models with an
                 // API key, and editors show this list as the model picker.
                 let configured: Vec<String> = std::env::var("ONDE_CODE_MODELS")
@@ -166,7 +182,7 @@ impl CoderAgent {
                 let mut ids = if !configured.is_empty() {
                     configured
                 } else {
-                    match self.llm.models().await {
+                    match llm.models().await {
                         Ok(models) => models.into_iter().map(|m| m.id).collect(),
                         Err(e) => {
                             tracing::warn!("listing models failed, offering only {default}: {e:#}");
@@ -178,16 +194,28 @@ impl CoderAgent {
                     ids.insert(0, default);
                 }
                 ids
-            })
-            .await
+            }
+        };
+        *cache = Some(ids.clone());
+        ids
+    }
+
+    fn llm(&self) -> LlmClient {
+        self.llm.read().unwrap().clone()
+    }
+
+    /// Re-read credentials (env + stored config file) and drop the cached model list.
+    async fn reload_llm(&self) {
+        *self.llm.write().unwrap() = LlmClient::new(LlmConfig::from_env());
+        *self.models.lock().await = None;
     }
 
     async fn config_options(&self, current: &str) -> Vec<SessionConfigOption> {
         let options = self
             .models()
             .await
-            .iter()
-            .map(|id| SessionConfigSelectOption::new(id.clone(), id.clone()))
+            .into_iter()
+            .map(|id| SessionConfigSelectOption::new(id.clone(), id))
             .collect();
         vec![
             SessionConfigOption::select(
@@ -238,7 +266,7 @@ impl CoderAgent {
         let cwd = tools::absolutize(&cwd);
         let roots: Vec<PathBuf> = roots.into_iter().map(|r| tools::absolutize(&r)).collect();
         let id = SessionId::new(uuid::Uuid::new_v4().to_string());
-        let model = self.llm.model().to_string();
+        let model = self.llm().model().to_string();
         let options = self.config_options(&model).await;
         // ACP v1: connect to all stdio MCP servers the client specifies.
         let mcp_registry = mcp::McpRegistry::connect_all(&mcp_servers).await;
@@ -252,6 +280,7 @@ impl CoderAgent {
             cancel: CancellationToken::new(),
             always_allowed: Arc::default(),
             mcp: Arc::new(tokio::sync::Mutex::new(mcp_registry)),
+            always_rejected: Arc::default(),
             title: None,
             updated_at: now_secs(),
         };
@@ -261,7 +290,15 @@ impl CoderAgent {
 
     /// List live sessions, optionally filtered by working directory. Sessions are kept in
     /// memory only, so only sessions created by this process show up, most recent first.
-    fn list_sessions(&self, req: ListSessionsRequest) -> ListSessionsResponse {
+    fn list_sessions(
+        &self,
+        req: ListSessionsRequest,
+    ) -> agent_client_protocol::Result<ListSessionsResponse> {
+        // Every session fits in one page, so we never hand out a cursor; any cursor is stale.
+        if let Some(cursor) = &req.cursor {
+            return Err(agent_client_protocol::Error::invalid_params()
+                .data(format!("invalid cursor {cursor}")));
+        }
         let sessions = self.sessions.lock().unwrap();
         // Sort on the raw epoch seconds; the ISO 8601 string is only for display.
         let mut entries: Vec<(u64, SessionInfo)> = sessions
@@ -276,7 +313,17 @@ impl CoderAgent {
             })
             .collect();
         entries.sort_by_key(|(updated, _)| std::cmp::Reverse(*updated));
-        ListSessionsResponse::new(entries.into_iter().map(|(_, info)| info).collect())
+        Ok(ListSessionsResponse::new(
+            entries.into_iter().map(|(_, info)| info).collect(),
+        ))
+    }
+
+    /// Forget a session. Idempotent: deleting an unknown session succeeds.
+    fn delete_session(&self, req: DeleteSessionRequest) -> DeleteSessionResponse {
+        if let Some(s) = self.sessions.lock().unwrap().remove(&req.session_id) {
+            s.cancel.cancel();
+        }
+        DeleteSessionResponse::new()
     }
 
     fn cancel(&self, session_id: &SessionId) {
@@ -436,10 +483,12 @@ impl CoderAgent {
         connection: ConnectionTo<Client>,
     ) -> anyhow::Result<StopReason> {
         let session_id = request.session_id.clone();
-        let prompt_text = prompt_to_text(&request.prompt);
-        let prompt_content = prompt_to_content(&request.prompt);
+        let caps = self.client_caps.lock().unwrap().clone();
+        let prompt = resolve_resource_links(&request.prompt, &caps, &connection, &session_id).await;
+        let prompt_text = prompt_to_text(&prompt);
+        let prompt_content = prompt_to_content(&prompt);
         // Take the history out while the turn runs; it's put back at the end.
-        let (cwd, roots, model, mut messages, cancel, always_allowed, mcp) = {
+        let (cwd, roots, model, mut messages, cancel, always_allowed, always_rejected, mcp) = {
             let mut sessions = self.sessions.lock().unwrap();
             let s = sessions
                 .get_mut(&session_id)
@@ -456,6 +505,7 @@ impl CoderAgent {
                 std::mem::take(&mut s.messages),
                 s.cancel.clone(),
                 s.always_allowed.clone(),
+                s.always_rejected.clone(),
                 s.mcp.clone(),
             )
         };
@@ -466,10 +516,11 @@ impl CoderAgent {
             session_id: session_id.clone(),
             cwd: cwd.clone(),
             roots,
-            caps: self.client_caps.lock().unwrap().clone(),
+            caps,
             cancel: cancel.clone(),
             yolo: self.yolo,
             always_allowed,
+            always_rejected,
         };
         let result = self.agent_loop(&ctx, &model, &mut messages, &mcp).await;
 
@@ -497,6 +548,10 @@ impl CoderAgent {
             merged.as_array_mut().unwrap().extend(mcp_defs);
             merged
         };
+        let llm = self.llm();
+        // One message id per assistant message, so clients can group streamed chunks.
+        let mut message_id = MessageId::new(uuid::Uuid::new_v4().to_string());
+        let mut thought_id = MessageId::new(uuid::Uuid::new_v4().to_string());
         let notify = |update: SessionUpdate| {
             ctx.connection
                 .send_notification(SessionNotification::new(ctx.session_id.clone(), update))
@@ -504,10 +559,14 @@ impl CoderAgent {
 
         for _ in 0..MAX_TURNS {
             let completion = tokio::select! {
-                r = self.llm.complete(&ctx.session_id.0, model, messages, &tool_defs, |delta| {
+                r = llm.complete(&ctx.session_id.0, model, messages, &tool_defs, |delta| {
                     let update = match delta {
-                        Delta::Text(t) => SessionUpdate::AgentMessageChunk(ContentChunk::new(t.to_string().into())),
-                        Delta::Reasoning(t) => SessionUpdate::AgentThoughtChunk(ContentChunk::new(t.to_string().into())),
+                        Delta::Text(t) => SessionUpdate::AgentMessageChunk(
+                            ContentChunk::new(t.to_string().into()).message_id(message_id.clone()),
+                        ),
+                        Delta::Reasoning(t) => SessionUpdate::AgentThoughtChunk(
+                            ContentChunk::new(t.to_string().into()).message_id(thought_id.clone()),
+                        ),
                     };
                     if let Err(e) = notify(update) {
                         tracing::warn!("failed to send update: {e}");
@@ -516,6 +575,19 @@ impl CoderAgent {
                 () = ctx.cancel.cancelled() => return Ok(StopReason::Cancelled),
             };
             messages.push(completion.to_message());
+            message_id = MessageId::new(uuid::Uuid::new_v4().to_string());
+            thought_id = MessageId::new(uuid::Uuid::new_v4().to_string());
+            if let Some(usage) = completion.usage {
+                // `size` is the model's context window, which OpenAI-style endpoints don't
+                // report; take it from ONDE_CODE_CONTEXT_WINDOW, defaulting to 128k.
+                let used = usage.total_tokens.max(usage.prompt_tokens + usage.completion_tokens);
+                let size = std::env::var("ONDE_CODE_CONTEXT_WINDOW")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(DEFAULT_CONTEXT_WINDOW)
+                    .max(used);
+                notify(SessionUpdate::UsageUpdate(UsageUpdate::new(used, size)))?;
+            }
 
             if completion.tool_calls.is_empty() {
                 return Ok(match completion.finish_reason.as_deref() {
@@ -580,7 +652,8 @@ impl CoderAgent {
                     &tc.id,
                     ToolCallUpdateFields::new()
                         .status(status)
-                        .content(outcome.content),
+                        .content(outcome.content)
+                        .raw_output(json!({ "output": outcome.text, "failed": outcome.failed })),
                 )?;
                 messages.push(tool_message(&tc.id, &outcome.text));
             }
@@ -608,6 +681,80 @@ fn session_title(prompt: &str) -> String {
     }
 }
 
+/// Largest file a `file://` resource link is inlined for; bigger ones stay as references.
+const MAX_LINKED_FILE_BYTES: usize = 256 * 1024;
+
+/// Replace `file://` resource links with embedded text contents so the model sees the file,
+/// reading through the client when it supports `fs/read_text_file` (unsaved buffers), else
+/// from disk. Links that can't be read are kept as references.
+async fn resolve_resource_links(
+    blocks: &[ContentBlock],
+    caps: &ClientCapabilities,
+    connection: &ConnectionTo<Client>,
+    session_id: &SessionId,
+) -> Vec<ContentBlock> {
+    let mut out = Vec::with_capacity(blocks.len());
+    for block in blocks {
+        if let ContentBlock::ResourceLink(link) = block
+            && let Some(path) = file_uri_path(&link.uri)
+        {
+            let text = if caps.fs.read_text_file {
+                connection
+                    .send_request(ReadTextFileRequest::new(session_id.clone(), path.clone()))
+                    .block_task()
+                    .await
+                    .map(|r| r.content)
+                    .map_err(|e| e.to_string())
+            } else {
+                tokio::fs::read_to_string(&path).await.map_err(|e| e.to_string())
+            };
+            match text {
+                Ok(text) if text.len() <= MAX_LINKED_FILE_BYTES => {
+                    out.push(ContentBlock::Resource(EmbeddedResource::new(
+                        EmbeddedResourceResource::TextResourceContents(
+                            TextResourceContents::new(text, link.uri.clone())
+                                .mime_type(link.mime_type.clone()),
+                        ),
+                    )));
+                    continue;
+                }
+                Ok(_) => tracing::debug!("{} too large to inline", link.uri),
+                Err(e) => tracing::debug!("could not read {}: {e}", link.uri),
+            }
+        }
+        out.push(block.clone());
+    }
+    out
+}
+
+/// Absolute path for a `file://` URI, percent-decoding the path.
+fn file_uri_path(uri: &str) -> Option<PathBuf> {
+    let rest = uri.strip_prefix("file://")?;
+    // Allow an authority of "" or "localhost"; reject other hosts.
+    let path = if rest.starts_with('/') {
+        rest
+    } else {
+        rest.strip_prefix("localhost")?
+    };
+    let bytes = path.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let Ok(b) = u8::from_str_radix(std::str::from_utf8(&bytes[i + 1..i + 3]).ok()?, 16)
+        {
+            decoded.push(b);
+            i += 3;
+        } else {
+            decoded.push(bytes[i]);
+            i += 1;
+        }
+    }
+    let path = PathBuf::from(String::from_utf8(decoded).ok()?);
+    path.is_absolute().then_some(path)
+}
+
 /// Flatten ACP prompt content into text for the model.
 fn prompt_to_text(blocks: &[ContentBlock]) -> String {
     let mut parts = Vec::new();
@@ -616,8 +763,16 @@ fn prompt_to_text(blocks: &[ContentBlock]) -> String {
             ContentBlock::Text(t) => parts.push(t.text.clone()),
             ContentBlock::ResourceLink(link) => parts.push(format!("[Referenced: {}]", link.uri)),
             ContentBlock::Resource(res) => {
-                if let EmbeddedResourceResource::TextResourceContents(r) = &res.resource {
-                    parts.push(format!("<file uri=\"{}\">\n{}\n</file>", r.uri, r.text));
+                match &res.resource {
+                    EmbeddedResourceResource::TextResourceContents(r) => {
+                        parts.push(format!("<file uri=\"{}\">\n{}\n</file>", r.uri, r.text));
+                    }
+                    EmbeddedResourceResource::BlobResourceContents(b) => parts.push(format!(
+                        "[Attached binary resource: {} ({})]",
+                        b.uri,
+                        b.mime_type.as_deref().unwrap_or("unknown type")
+                    )),
+                    _ => {}
                 }
             }
             _ => {}
@@ -827,14 +982,14 @@ async fn run_agent(yolo_flag: bool) -> agent_client_protocol::Result<()> {
         .init();
 
     let agent = CoderAgent {
-        llm: LlmClient::new(LlmConfig::from_env()),
+        llm: Arc::new(RwLock::new(LlmClient::new(LlmConfig::from_env()))),
         yolo: yolo_flag || std::env::var("ONDE_CODE_YOLO").is_ok_and(|v| v == "1" || v == "true"),
         surface: surface(),
         client_caps: Arc::default(),
         sessions: Arc::default(),
         models: Arc::default(),
     };
-    tracing::info!("onde-code starting with model {}", agent.llm.model());
+    tracing::info!("onde-code starting with model {}", agent.llm().model());
 
     Agent
         .builder()
@@ -844,9 +999,15 @@ async fn run_agent(yolo_flag: bool) -> agent_client_protocol::Result<()> {
                 let agent = agent.clone();
                 async move |req: InitializeRequest, responder, _cx| {
                     *agent.client_caps.lock().unwrap() = req.client_capabilities.clone();
+                    // Terminal auth is only usable by clients that can run it.
+                    let methods = if req.client_capabilities.auth.terminal {
+                        auth_methods()
+                    } else {
+                        Vec::new()
+                    };
                     responder.respond(
                         InitializeResponse::new(req.protocol_version)
-                            .auth_methods(auth_methods())
+                            .auth_methods(methods)
                             .agent_capabilities(
                                 AgentCapabilities::new()
                                     .prompt_capabilities(
@@ -861,7 +1022,12 @@ async fn run_agent(yolo_flag: bool) -> agent_client_protocol::Result<()> {
                                                 SessionAdditionalDirectoriesCapabilities::new(),
                                             )
                                             .resume(SessionResumeCapabilities::new())
-                                            .close(SessionCloseCapabilities::new()),
+                                            .close(SessionCloseCapabilities::new())
+                                            .delete(SessionDeleteCapabilities::new()),
+                                    )
+                                    .auth(
+                                        AgentAuthCapabilities::new()
+                                            .logout(LogoutCapabilities::new()),
                                     )
                                     .load_session(true),
                             )
@@ -881,7 +1047,7 @@ async fn run_agent(yolo_flag: bool) -> agent_client_protocol::Result<()> {
                     // Listing models is a network call; keep it off the dispatch loop.
                     let agent = agent.clone();
                     cx.spawn(async move {
-                        if !agent.llm.has_api_key() {
+                        if !agent.llm().has_api_key() {
                             return responder.respond_with_error(auth_required_error());
                         }
                         responder.respond(
@@ -898,7 +1064,10 @@ async fn run_agent(yolo_flag: bool) -> agent_client_protocol::Result<()> {
             {
                 let agent = agent.clone();
                 async move |req: ListSessionsRequest, responder, _cx| {
-                    responder.respond(agent.list_sessions(req))
+                    match agent.list_sessions(req) {
+                        Ok(r) => responder.respond(r),
+                        Err(e) => responder.respond_with_error(e),
+                    }
                 }
             },
             agent_client_protocol::on_receive_request!(),
@@ -968,11 +1137,65 @@ async fn run_agent(yolo_flag: bool) -> agent_client_protocol::Result<()> {
                     let agent = agent.clone();
                     let connection = cx.clone();
                     cx.spawn(async move {
-                        if !agent.llm.has_api_key() {
+                        if !agent.llm().has_api_key() {
                             return responder.respond_with_error(auth_required_error());
                         }
                         agent.prompt(req, responder, connection).await
                     })
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let agent = agent.clone();
+                async move |req: AuthenticateRequest, responder, cx| {
+                    let agent = agent.clone();
+                    cx.spawn(async move {
+                        if &*req.method_id.0 != AUTH_METHOD_ID {
+                            return responder.respond_with_error(
+                                agent_client_protocol::Error::invalid_params()
+                                    .data(format!("unknown auth method {}", req.method_id.0)),
+                            );
+                        }
+                        // The client has run `onde-code --setup`; pick up the stored key.
+                        agent.reload_llm().await;
+                        if !agent.llm().has_api_key() {
+                            return responder.respond_with_error(auth_required_error());
+                        }
+                        responder.respond(AuthenticateResponse::new())
+                    })
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let agent = agent.clone();
+                async move |_req: LogoutRequest, responder, cx| {
+                    let agent = agent.clone();
+                    cx.spawn(async move {
+                        if let Some(path) = llm::config_dir().map(|d| d.join("env"))
+                            && let Err(e) = std::fs::remove_file(&path)
+                            && e.kind() != std::io::ErrorKind::NotFound
+                        {
+                            return responder.respond_with_error(
+                                agent_client_protocol::Error::internal_error()
+                                    .data(format!("removing {}: {e}", path.display())),
+                            );
+                        }
+                        agent.reload_llm().await;
+                        responder.respond(LogoutResponse::new())
+                    })
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let agent = agent.clone();
+                async move |req: DeleteSessionRequest, responder, _cx| {
+                    responder.respond(agent.delete_session(req))
                 }
             },
             agent_client_protocol::on_receive_request!(),

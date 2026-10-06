@@ -286,6 +286,18 @@ pub struct Completion {
     pub content: String,
     pub tool_calls: Vec<ToolCallRequest>,
     pub finish_reason: Option<String>,
+    /// Token usage, when the endpoint reports it (`stream_options.include_usage`).
+    pub usage: Option<Usage>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+pub struct Usage {
+    #[serde(default)]
+    pub prompt_tokens: u64,
+    #[serde(default)]
+    pub completion_tokens: u64,
+    #[serde(default)]
+    pub total_tokens: u64,
 }
 
 impl Completion {
@@ -323,6 +335,7 @@ pub enum Delta<'a> {
 struct Chunk {
     #[serde(default)]
     choices: Vec<Choice>,
+    usage: Option<Usage>,
 }
 
 #[derive(Deserialize)]
@@ -479,28 +492,38 @@ impl LlmClient {
                 self.config.provider.key_var()
             );
         }
-        let body = json!({
+        let mut body = json!({
             "model": model,
             "messages": messages,
             "tools": tools,
             "stream": true,
+            "stream_options": { "include_usage": true },
         });
-        let mut req = self
-            .http
-            .post(format!("{}/chat/completions", self.config.base_url))
-            .json(&body);
-        if let Some(key) = &self.config.api_key {
-            req = req.bearer_auth(key);
-        }
-        if let Some(key) = &self.config.condense_key {
-            req = req
-                .header("X-Condense-Auth-Token", key)
-                .header("X-Condense-Session-Id", session_id);
-        }
-        let resp = req
-            .send()
+        let send = |body: &Value| {
+            let mut req = self
+                .http
+                .post(format!("{}/chat/completions", self.config.base_url))
+                .json(body);
+            if let Some(key) = &self.config.api_key {
+                req = req.bearer_auth(key);
+            }
+            if let Some(key) = &self.config.condense_key {
+                req = req
+                    .header("X-Condense-Auth-Token", key)
+                    .header("X-Condense-Session-Id", session_id);
+            }
+            req.send()
+        };
+        let mut resp = send(&body)
             .await
             .context("sending chat completion request")?;
+        // Not every OpenAI-compatible server knows `stream_options`; retry without it.
+        if matches!(resp.status().as_u16(), 400 | 422) {
+            body.as_object_mut().unwrap().remove("stream_options");
+            resp = send(&body)
+                .await
+                .context("sending chat completion request")?;
+        }
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
@@ -529,6 +552,9 @@ impl LlmClient {
                         continue;
                     }
                 };
+                if chunk.usage.is_some() {
+                    out.usage = chunk.usage;
+                }
                 for choice in chunk.choices {
                     let d = choice.delta;
                     if let Some(r) = d.reasoning_content.as_deref().or(d.reasoning.as_deref()) {
