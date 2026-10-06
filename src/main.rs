@@ -103,6 +103,8 @@ fn iso8601(secs: u64) -> String {
 struct CoderAgent {
     llm: LlmClient,
     yolo: bool,
+    /// How the agent was launched: `tui` (interactive terminal UI) or `acp` (editor).
+    surface: &'static str,
     client_caps: Arc<Mutex<ClientCapabilities>>,
     sessions: Arc<Mutex<HashMap<SessionId, Session>>>,
     /// Models offered for selection, fetched from `GET /models` on first use.
@@ -137,9 +139,10 @@ impl CoderAgent {
              edit_file for small changes, and run commands to build or test your work. Keep \
              answers concise and use Markdown.\n\
              When creating git commits, include the trailer:\n\
-             Co-Authored-By: OndeCode v{version} <noreply@ondeinference.com> https://github.com/kelvin-soen/OndeCode",
+             Co-Authored-By: OndeCode v{version} -{surface} <noreply@ondeinference.com>",
             cwd.display(),
             version = env!("CARGO_PKG_VERSION"),
+            surface = self.surface,
         )
     }
 
@@ -738,6 +741,16 @@ async fn list_models() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// How the agent was launched: `tui` (interactive terminal UI) or `acp` (editor).
+/// The TUI sets `ONDE_CODE_SURFACE=tui` on its subprocess; editors launch `--acp`
+/// directly so the default is `acp`.
+fn surface() -> &'static str {
+    match std::env::var("ONDE_CODE_SURFACE") {
+        Ok(s) if s == "tui" => "tui",
+        _ => "acp",
+    }
+}
+
 async fn run_agent(yolo_flag: bool) -> agent_client_protocol::Result<()> {
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
@@ -747,6 +760,7 @@ async fn run_agent(yolo_flag: bool) -> agent_client_protocol::Result<()> {
     let agent = CoderAgent {
         llm: LlmClient::new(LlmConfig::from_env()),
         yolo: yolo_flag || std::env::var("ONDE_CODE_YOLO").is_ok_and(|v| v == "1" || v == "true"),
+        surface: surface(),
         client_caps: Arc::default(),
         sessions: Arc::default(),
         models: Arc::default(),

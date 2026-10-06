@@ -36,6 +36,7 @@ enum AppEvent {
 
 pub async fn run(yolo: bool, extra_roots: Vec<PathBuf>) -> anyhow::Result<()> {
     let mut config = AcpAgentConfig::new(std::env::current_exe()?).arg("--acp");
+    config = config.env("ONDE_CODE_SURFACE", "tui");
     if yolo {
         config = config.arg("--yolo");
     }
