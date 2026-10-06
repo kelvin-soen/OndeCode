@@ -21,3 +21,7 @@ tokio-util = "0.7.19"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 uuid = { version = "1.27.0", features = ["v4"] }
+
+[[bin]]
+name = "fake-mcp-server"
+path = "src/bin/fake_mcp_server.rs"

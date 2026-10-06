@@ -13,11 +13,11 @@ use std::sync::{Arc, Mutex};
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
     CancelNotification, ClientCapabilities, ContentBlock, FileSystemCapabilities,
-    InitializeRequest, NewSessionRequest, PermissionOptionId, PromptRequest, ReadTextFileRequest,
-    ReadTextFileResponse, RequestPermissionOutcome, RequestPermissionRequest,
-    RequestPermissionResponse, SelectedPermissionOutcome, SessionNotification, SessionUpdate,
-    StopReason, TextContent, ToolCallContent, ToolCallStatus, WriteTextFileRequest,
-    WriteTextFileResponse,
+    InitializeRequest, McpServer, McpServerHttp, McpServerStdio, NewSessionRequest,
+    PermissionOptionId, PromptRequest, ReadTextFileRequest, ReadTextFileResponse,
+    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
+    SelectedPermissionOutcome, SessionNotification, SessionUpdate, StopReason, TextContent,
+    ToolCallContent, ToolCallStatus, WriteTextFileRequest, WriteTextFileResponse,
 };
 use agent_client_protocol::{AcpAgent, AcpAgentConfig, Agent, Client, ConnectionTo};
 use serde_json::{Value, json};
@@ -846,6 +846,283 @@ async fn acp_tool_metadata_paths_are_absolute() {
     assert_eq!(
         std::fs::read_to_string(workdir.join("new/dir/created.txt")).unwrap(),
         "hi"
+    );
+
+    std::fs::remove_dir_all(&workdir).ok();
+}
+
+// ---------------------------------------------------------------------------
+// ACP v1 MCP servers over stdio (https://agentclientprotocol.com/protocol/v1/session-setup#mcp-servers)
+// ---------------------------------------------------------------------------
+
+/// Mock LLM that accepts a variable number of tools (built-in + MCP).
+async fn start_mock_llm_flexible(script: Script, expected_tools: usize) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        loop {
+            let (mut socket, _) = match listener.accept().await {
+                Ok(s) => s,
+                Err(_) => return,
+            };
+            let steps = script.0.clone();
+            tokio::spawn(async move {
+                let (head, body) = read_http_request(&mut socket).await;
+                assert!(
+                    head.starts_with("POST /v1/chat/completions"),
+                    "unexpected request: {}",
+                    head.lines().next().unwrap_or("")
+                );
+                let payload: Value = serde_json::from_str(&body).unwrap();
+                assert_eq!(payload["model"], "scripted-test-model");
+                assert_eq!(payload["stream"], true);
+                assert_eq!(
+                    payload["tools"].as_array().unwrap().len(),
+                    expected_tools,
+                    "agent must expose {expected_tools} tools"
+                );
+
+                let messages = payload["messages"].as_array().unwrap();
+                let step = Script(steps).step_for(messages);
+
+                let mut data = String::new();
+                match step {
+                    Step::ToolCall { name, arguments } => {
+                        data.push_str(&sse_chunk(
+                            None,
+                            Some(("call_1", name, &arguments.to_string())),
+                            None,
+                        ));
+                        data.push_str(&sse_chunk(None, None, Some("tool_calls")));
+                    }
+                    Step::Final(text) => {
+                        data.push_str(&sse_chunk(Some(text), None, None));
+                        data.push_str(&sse_chunk(None, None, Some("stop")));
+                    }
+                }
+                data.push_str("data: [DONE]\n\n");
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    data.len(),
+                    data
+                );
+                socket.write_all(resp.as_bytes()).await.unwrap();
+                socket.shutdown().await.unwrap();
+            });
+        }
+    });
+    format!("http://127.0.0.1:{port}/v1")
+}
+
+/// The agent must connect to stdio MCP servers specified in `session/new`,
+/// surface their tools to the model, and forward tool calls + results.
+#[tokio::test]
+async fn acp_mcp_stdio_tool_is_forwarded() {
+    // Build the fake MCP server binary so we can point the agent at it.
+    let mcp_binary = env!("CARGO_BIN_EXE_fake-mcp-server");
+
+    // Script: model calls the MCP echo tool, then gives a final answer.
+    let script = Script(vec![
+        Step::ToolCall {
+            name: "mcp__fake-mcp__echo",
+            arguments: json!({"message": "hello from mcp"}),
+        },
+        Step::Final("MCP echo returned: hello from mcp"),
+    ]);
+    // 5 built-in tools + 1 MCP tool = 6
+    let base_url = start_mock_llm_flexible(script, 6).await;
+    let workdir = temp_workdir();
+
+    let mcp_server = McpServerStdio::new("fake-mcp", mcp_binary);
+
+    let binary = env!("CARGO_BIN_EXE_onde-code");
+    let agent = AcpAgent::new(
+        AcpAgentConfig::new(binary)
+            .env("OPENAI_BASE_URL", &base_url)
+            .env("OPENAI_MODEL", "scripted-test-model")
+            .env("CONDENSE_API_KEY", DEBUG_KEY),
+    );
+    let captured: Arc<Mutex<Captured>> = Arc::default();
+    let captured_notify = captured.clone();
+
+    let workdir_clone = workdir.clone();
+    let mcp_server_clone = mcp_server.clone();
+
+    let stop_reason = Client
+        .builder()
+        .on_receive_notification(
+            async move |n: SessionNotification, _cx| {
+                let mut c = captured_notify.lock().unwrap();
+                match n.update {
+                    SessionUpdate::AgentMessageChunk(chunk) => {
+                        if let ContentBlock::Text(t) = chunk.content {
+                            c.text.push_str(&t.text);
+                        }
+                    }
+                    SessionUpdate::ToolCall(tc) => {
+                        c.tool_calls.push((tc.title.clone(), tc.status));
+                    }
+                    SessionUpdate::ToolCallUpdate(upd) => {
+                        if let Some(status) = upd.fields.status {
+                            c.tool_updates
+                                .push((upd.tool_call_id.0.to_string(), status));
+                        }
+                    }
+                    _ => {}
+                }
+                Ok(())
+            },
+            agent_client_protocol::on_receive_notification!(),
+        )
+        .on_receive_request(
+            async move |req: RequestPermissionRequest, responder, _cx| {
+                // Auto-approve everything.
+                let option = req
+                    .options
+                    .iter()
+                    .find(|o| o.option_id.0.as_ref() == "allow_always")
+                    .unwrap_or_else(|| panic!("no allow_always option: {:?}", req.options));
+                responder.respond(RequestPermissionResponse::new(
+                    RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(
+                        PermissionOptionId::new(option.option_id.0.clone()),
+                    )),
+                ))
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .connect_with(agent, |connection: ConnectionTo<Agent>| async move {
+            let init = connection
+                .send_request(
+                    InitializeRequest::new(ProtocolVersion::V1)
+                        .client_capabilities(ClientCapabilities::new()),
+                )
+                .block_task()
+                .await?;
+            assert_eq!(init.agent_info.as_ref().unwrap().name, "onde-code");
+
+            let session = connection
+                .send_request(
+                    NewSessionRequest::new(workdir_clone)
+                        .mcp_servers(vec![McpServer::Stdio(mcp_server_clone)]),
+                )
+                .block_task()
+                .await?;
+            let session_id = session.session_id;
+
+            let resp = connection
+                .send_request(PromptRequest::new(
+                    session_id,
+                    vec![ContentBlock::Text(TextContent::new("Call the echo tool"))],
+                ))
+                .block_task()
+                .await?;
+            Ok(resp.stop_reason)
+        })
+        .await
+        .expect("ACP session failed");
+
+    assert_eq!(stop_reason, StopReason::EndTurn);
+    let c = captured.lock().unwrap();
+    assert!(
+        c.text.contains("hello from mcp"),
+        "model should have received the MCP echo result: {}",
+        c.text
+    );
+    // The MCP tool call should have been reported as a tool call notification.
+    assert_eq!(
+        c.tool_calls.len(),
+        1,
+        "expected one MCP tool call: {:?}",
+        c.tool_calls
+    );
+    // The MCP tool call should have completed successfully.
+    assert!(
+        c.tool_updates
+            .iter()
+            .any(|(_, s)| *s == ToolCallStatus::Completed),
+        "MCP tool call should complete: {:?}",
+        c.tool_updates
+    );
+    drop(c);
+
+    std::fs::remove_dir_all(&workdir).ok();
+}
+
+/// A broken MCP server (wrong command / HTTP transport) must not fail the
+/// session: the agent logs a warning, still serves its built-in tools, and the
+/// turn completes normally.
+#[tokio::test]
+async fn acp_mcp_broken_server_does_not_fail_session() {
+    let script = Script(vec![Step::Final("session still works")]);
+    // No MCP tools merged: only the 5 built-in tools are exposed.
+    let base_url = start_mock_llm_flexible(script, 5).await;
+    let workdir = temp_workdir();
+
+    let binary = env!("CARGO_BIN_EXE_onde-code");
+    let agent = AcpAgent::new(
+        AcpAgentConfig::new(binary)
+            .env("OPENAI_BASE_URL", &base_url)
+            .env("OPENAI_MODEL", "scripted-test-model")
+            .env("CONDENSE_API_KEY", DEBUG_KEY),
+    );
+    let captured: Arc<Mutex<Captured>> = Arc::default();
+    let captured_notify = captured.clone();
+    let workdir_clone = workdir.clone();
+
+    let stop_reason = Client
+        .builder()
+        .on_receive_notification(
+            async move |n: SessionNotification, _cx| {
+                if let SessionUpdate::AgentMessageChunk(chunk) = n.update {
+                    if let ContentBlock::Text(t) = chunk.content {
+                        captured_notify.lock().unwrap().text.push_str(&t.text);
+                    }
+                }
+                Ok(())
+            },
+            agent_client_protocol::on_receive_notification!(),
+        )
+        .connect_with(agent, |connection: ConnectionTo<Agent>| async move {
+            connection
+                .send_request(
+                    InitializeRequest::new(ProtocolVersion::V1)
+                        .client_capabilities(ClientCapabilities::new()),
+                )
+                .block_task()
+                .await?;
+
+            // One server that can't be spawned, one HTTP server we don't support.
+            let session = connection
+                .send_request(NewSessionRequest::new(workdir_clone).mcp_servers(vec![
+                    McpServer::Stdio(McpServerStdio::new(
+                        "missing",
+                        "/nonexistent/mcp-server-binary",
+                    )),
+                    McpServer::Http(McpServerHttp::new("remote", "https://example.com/mcp")),
+                ]))
+                .block_task()
+                .await?;
+            let session_id = session.session_id;
+
+            let resp = connection
+                .send_request(PromptRequest::new(
+                    session_id,
+                    vec![ContentBlock::Text(TextContent::new("say hi"))],
+                ))
+                .block_task()
+                .await?;
+            Ok(resp.stop_reason)
+        })
+        .await
+        .expect("session must survive broken MCP servers");
+
+    assert_eq!(stop_reason, StopReason::EndTurn);
+    assert!(
+        captured
+            .lock()
+            .unwrap()
+            .text
+            .contains("session still works")
     );
 
     std::fs::remove_dir_all(&workdir).ok();

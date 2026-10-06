@@ -5,6 +5,7 @@
 //! CONDENSE_API_KEY. Set ONDE_CODE_YOLO=1 to skip permission prompts. Logs go to stderr (RUST_LOG).
 
 mod llm;
+mod mcp;
 mod tools;
 mod tui;
 
@@ -19,7 +20,7 @@ use agent_client_protocol::schema::v1::{
     AgentCapabilities, AuthMethod, AuthMethodTerminal, CancelNotification, ClientCapabilities,
     CloseSessionRequest, CloseSessionResponse, ContentBlock, ContentChunk,
     EmbeddedResourceResource, Implementation, InitializeRequest, InitializeResponse,
-    ListSessionsRequest, ListSessionsResponse, LoadSessionRequest, LoadSessionResponse,
+    ListSessionsRequest, ListSessionsResponse, LoadSessionRequest, LoadSessionResponse, McpServer,
     NewSessionRequest, NewSessionResponse, PromptCapabilities, PromptRequest, PromptResponse,
     ResumeSessionRequest, ResumeSessionResponse, SessionAdditionalDirectoriesCapabilities,
     SessionCapabilities, SessionCloseCapabilities, SessionConfigOption,
@@ -62,6 +63,8 @@ struct Session {
     messages: Vec<Value>,
     cancel: CancellationToken,
     always_allowed: Arc<Mutex<HashSet<String>>>,
+    /// Connected MCP servers for this session (stdio transport).
+    mcp: Arc<tokio::sync::Mutex<mcp::McpRegistry>>,
     /// Human-readable title shown by `session/list`: the first user prompt.
     title: Option<String>,
     /// Last activity, seconds since the Unix epoch (reported by `session/list`).
@@ -224,7 +227,12 @@ impl CoderAgent {
         ))
     }
 
-    async fn new_session(&self, cwd: PathBuf, roots: Vec<PathBuf>) -> NewSessionResponse {
+    async fn new_session(
+        &self,
+        cwd: PathBuf,
+        roots: Vec<PathBuf>,
+        mcp_servers: Vec<McpServer>,
+    ) -> NewSessionResponse {
         // ACP v1: `cwd` and additional directories must be absolute paths. Normalize
         // defensively so a sloppy client can't bind the session to a relative path.
         let cwd = tools::absolutize(&cwd);
@@ -232,6 +240,8 @@ impl CoderAgent {
         let id = SessionId::new(uuid::Uuid::new_v4().to_string());
         let model = self.llm.model().to_string();
         let options = self.config_options(&model).await;
+        // ACP v1: connect to all stdio MCP servers the client specifies.
+        let mcp_registry = mcp::McpRegistry::connect_all(&mcp_servers).await;
         let session = Session {
             messages: vec![
                 json!({ "role": "system", "content": self.system_prompt(&cwd, &roots) }),
@@ -241,6 +251,7 @@ impl CoderAgent {
             roots,
             cancel: CancellationToken::new(),
             always_allowed: Arc::default(),
+            mcp: Arc::new(tokio::sync::Mutex::new(mcp_registry)),
             title: None,
             updated_at: now_secs(),
         };
@@ -342,6 +353,13 @@ impl CoderAgent {
             }
         }
         let options = self.config_options(&model).await;
+        // ACP v1: connect to MCP servers specified in the load request.
+        if !req.mcp_servers.is_empty() {
+            let registry = mcp::McpRegistry::connect_all(&req.mcp_servers).await;
+            if let Some(s) = self.sessions.lock().unwrap().get_mut(&session_id) {
+                s.mcp = Arc::new(tokio::sync::Mutex::new(registry));
+            }
+        }
         Ok(LoadSessionResponse::new().config_options(options))
     }
 
@@ -369,6 +387,13 @@ impl CoderAgent {
             s.updated_at = now_secs();
             s.model.clone()
         };
+        // ACP v1: connect to MCP servers specified in the resume request.
+        if !req.mcp_servers.is_empty() {
+            let registry = mcp::McpRegistry::connect_all(&req.mcp_servers).await;
+            if let Some(s) = self.sessions.lock().unwrap().get_mut(&session_id) {
+                s.mcp = Arc::new(tokio::sync::Mutex::new(registry));
+            }
+        }
         let options = self.config_options(&model).await;
         Ok(ResumeSessionResponse::new().config_options(options))
     }
@@ -414,7 +439,7 @@ impl CoderAgent {
         let prompt_text = prompt_to_text(&request.prompt);
         let prompt_content = prompt_to_content(&request.prompt);
         // Take the history out while the turn runs; it's put back at the end.
-        let (cwd, roots, model, mut messages, cancel, always_allowed) = {
+        let (cwd, roots, model, mut messages, cancel, always_allowed, mcp) = {
             let mut sessions = self.sessions.lock().unwrap();
             let s = sessions
                 .get_mut(&session_id)
@@ -431,6 +456,7 @@ impl CoderAgent {
                 std::mem::take(&mut s.messages),
                 s.cancel.clone(),
                 s.always_allowed.clone(),
+                s.mcp.clone(),
             )
         };
         messages.push(json!({ "role": "user", "content": prompt_content }));
@@ -445,7 +471,7 @@ impl CoderAgent {
             yolo: self.yolo,
             always_allowed,
         };
-        let result = self.agent_loop(&ctx, &model, &mut messages).await;
+        let result = self.agent_loop(&ctx, &model, &mut messages, &mcp).await;
 
         if let Some(s) = self.sessions.lock().unwrap().get_mut(&session_id) {
             s.messages = messages;
@@ -459,8 +485,18 @@ impl CoderAgent {
         ctx: &ToolCtx,
         model: &str,
         messages: &mut Vec<Value>,
+        mcp: &tokio::sync::Mutex<mcp::McpRegistry>,
     ) -> anyhow::Result<StopReason> {
-        let tool_defs = tools::definitions();
+        // Merge built-in tool definitions with MCP tools from connected servers.
+        let builtin_defs = tools::definitions();
+        let mcp_defs = mcp.lock().await.tool_definitions();
+        let tool_defs = if mcp_defs.is_empty() {
+            builtin_defs
+        } else {
+            let mut merged = builtin_defs;
+            merged.as_array_mut().unwrap().extend(mcp_defs);
+            merged
+        };
         let notify = |update: SessionUpdate| {
             ctx.connection
                 .send_notification(SessionNotification::new(ctx.session_id.clone(), update))
@@ -495,7 +531,12 @@ impl CoderAgent {
                     continue;
                 }
                 let args: Value = serde_json::from_str(&tc.arguments).unwrap_or_else(|_| json!({}));
-                let (title, kind, locations) = tools::describe(ctx, &tc.name, &args);
+                // MCP tools report their own title/kind; built-ins use the local describe().
+                let (title, kind, locations) = if tc.name.starts_with(mcp::TOOL_PREFIX) {
+                    mcp::McpRegistry::describe(&tc.name)
+                } else {
+                    tools::describe(ctx, &tc.name, &args)
+                };
                 notify(SessionUpdate::ToolCall(
                     ToolCall::new(tc.id.clone(), title)
                         .kind(kind)
@@ -506,6 +547,26 @@ impl CoderAgent {
 
                 let outcome = if serde_json::from_str::<Value>(&tc.arguments).is_err() {
                     ToolOutcome::err(format!("Invalid JSON arguments: {}", tc.arguments))
+                } else if tc.name.starts_with(mcp::TOOL_PREFIX) {
+                    // Route MCP tool calls to the owning server. MCP content blocks are
+                    // structurally identical to ACP ones, so they pass through untransformed.
+                    match mcp.lock().await.try_call(&tc.name, &args).await {
+                        Ok(Some(result)) => ToolOutcome {
+                            text: result.text,
+                            content: result
+                                .content
+                                .into_iter()
+                                .map(|b| {
+                                    agent_client_protocol::schema::v1::ToolCallContent::from(b)
+                                })
+                                .collect(),
+                            failed: result.failed,
+                        },
+                        Ok(None) => {
+                            ToolOutcome::err(format!("no MCP server owns tool `{}`", tc.name))
+                        }
+                        Err(e) => ToolOutcome::err(format!("MCP tool error: {e:#}")),
+                    }
                 } else {
                     tools::execute(ctx, &tc.id, &tc.name, args).await
                 };
@@ -823,8 +884,11 @@ async fn run_agent(yolo_flag: bool) -> agent_client_protocol::Result<()> {
                         if !agent.llm.has_api_key() {
                             return responder.respond_with_error(auth_required_error());
                         }
-                        responder
-                            .respond(agent.new_session(req.cwd, req.additional_directories).await)
+                        responder.respond(
+                            agent
+                                .new_session(req.cwd, req.additional_directories, req.mcp_servers)
+                                .await,
+                        )
                     })
                 }
             },
