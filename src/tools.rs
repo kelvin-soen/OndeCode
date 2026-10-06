@@ -14,7 +14,7 @@ use agent_client_protocol::schema::v1::{
     TerminalOutputRequest, ToolCallContent, ToolCallLocation, ToolCallUpdate, ToolCallUpdateFields,
     ToolKind, WaitForTerminalExitRequest, WriteTextFileRequest,
 };
-use agent_client_protocol::{Client, ConnectionTo};
+use agent_client_protocol::{Client, ConnectionTo, ErrorCode};
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -261,7 +261,8 @@ impl ToolCtx {
         let a: ReadArgs = serde_json::from_value(args)?;
         let path = self.resolve_with(a.root.as_deref(), &a.path)?;
         let text = if self.caps.fs.read_text_file {
-            let mut req = ReadTextFileRequest::new(self.session_id.clone(), path.clone());
+            // ACP v1 fs/read_text_file requires an absolute path.
+            let mut req = ReadTextFileRequest::new(self.session_id.clone(), absolutize(&path));
             if let Some(l) = a.line {
                 req = req.line(l);
             }
@@ -291,25 +292,32 @@ impl ToolCtx {
         Ok(out)
     }
 
-    /// Read the current file contents for diffs/edits; `None` if it doesn't exist.
-    async fn read_existing(&self, path: &Path) -> Option<String> {
+    /// Read the current file contents for diffs/edits; `Ok(None)` if it doesn't exist.
+    /// A client-fs read failure is an error, distinct from a missing file (ACP
+    /// `ResourceNotFound`, code -32002), so callers don't mistake a failed read for
+    /// a new file.
+    async fn read_existing(&self, path: &Path) -> Result<Option<String>> {
         if self.caps.fs.read_text_file {
-            let req = ReadTextFileRequest::new(self.session_id.clone(), path.to_path_buf());
-            self.connection
-                .send_request(req)
-                .block_task()
-                .await
-                .ok()
-                .map(|r| r.content)
+            // ACP v1 fs/read_text_file requires an absolute path.
+            let req = ReadTextFileRequest::new(self.session_id.clone(), absolutize(path));
+            match self.connection.send_request(req).block_task().await {
+                Ok(r) => Ok(Some(r.content)),
+                Err(e) if e.code == ErrorCode::ResourceNotFound => Ok(None),
+                Err(e) => Err(anyhow!("client read of {} failed: {e}", path.display())),
+            }
         } else {
-            tokio::fs::read_to_string(path).await.ok()
+            match tokio::fs::read_to_string(path).await {
+                Ok(content) => Ok(Some(content)),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(e) => Err(anyhow!("reading {}: {e}", path.display())),
+            }
         }
     }
 
     async fn write_text(&self, path: &Path, content: &str) -> Result<()> {
         if self.caps.fs.write_text_file {
-            let req =
-                WriteTextFileRequest::new(self.session_id.clone(), path.to_path_buf(), content);
+            // ACP v1 fs/write_text_file requires an absolute path.
+            let req = WriteTextFileRequest::new(self.session_id.clone(), absolutize(path), content);
             self.connection.send_request(req).block_task().await?;
         } else {
             if let Some(parent) = path.parent() {
@@ -323,7 +331,7 @@ impl ToolCtx {
     async fn write_file(&self, id: &str, args: Value) -> Result<ToolOutcome> {
         let a: WriteArgs = serde_json::from_value(args)?;
         let path = self.resolve_with(a.root.as_deref(), &a.path)?;
-        let old = self.read_existing(&path).await;
+        let old = self.read_existing(&path).await?;
         let diff = Diff::new(path.clone(), a.content.clone()).old_text(old);
         self.apply_edit(id, "write_file", &path, &a.content, diff)
             .await
@@ -334,7 +342,7 @@ impl ToolCtx {
         let path = self.resolve_with(a.root.as_deref(), &a.path)?;
         let old = self
             .read_existing(&path)
-            .await
+            .await?
             .ok_or_else(|| anyhow!("{} does not exist", path.display()))?;
         match old.matches(&a.old_string).count() {
             0 => bail!("old_string not found in {}", path.display()),
@@ -563,6 +571,54 @@ fn resolve_in(base: &Path, path: &str) -> PathBuf {
     }
 }
 
+/// Make `path` absolute and free of `.`/`..` components, as the ACP v1 fs methods
+/// require an absolute path. Existing paths are canonicalized (resolving symlinks
+/// and giving the client the true on-disk location); paths that don't exist yet
+/// are normalized lexically with the existing parent canonicalized when possible.
+fn absolutize(path: &Path) -> PathBuf {
+    if let Ok(c) = std::fs::canonicalize(path) {
+        return c;
+    }
+    // Not on disk (yet): normalize lexically, anchoring at the canonicalized parent.
+    let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
+    let base = parent.and_then(|p| std::fs::canonicalize(p).ok());
+    let file_name = path.file_name().map(|f| f.to_os_string());
+    match (base, file_name) {
+        (Some(mut b), Some(f)) => {
+            b.push(f);
+            b
+        }
+        _ => normalize(path),
+    }
+}
+
+/// Lexically normalize a path: resolve `.` and `..` without touching the filesystem.
+/// Absolute paths stay absolute; relative paths are made absolute against the cwd.
+fn normalize(path: &Path) -> PathBuf {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(path)
+    };
+    let mut out: Vec<std::ffi::OsString> = Vec::new();
+    for c in absolute.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str().to_os_string()),
+        }
+    }
+    let mut result = PathBuf::new();
+    for part in out {
+        result.push(part);
+    }
+    result
+}
+
 fn truncate(mut s: String) -> String {
     if s.len() > MAX_OUTPUT_BYTES {
         let mut cut = MAX_OUTPUT_BYTES;
@@ -573,4 +629,58 @@ fn truncate(mut s: String) -> String {
         s.push_str("\n[truncated]");
     }
     s
+}
+
+#[cfg(test)]
+mod fs_path_tests {
+    use super::*;
+
+    fn assert_normalized_eq(input: &str, expected: &str) {
+        let n = normalize(Path::new(input));
+        // Compare on the prefix we control; a relative input is anchored at the cwd,
+        // so compare the tail after the anchor.
+        let expected = Path::new(expected);
+        let got = if expected.is_absolute() {
+            n.display().to_string()
+        } else {
+            let n = n.display().to_string();
+            n.rsplit_once('/')
+                .map(|(_, tail)| format!("/{tail}"))
+                .unwrap_or(n)
+        };
+        assert_eq!(got, expected.display().to_string());
+    }
+
+    #[test]
+    fn normalize_resolves_dot_dot_lexically() {
+        assert_normalized_eq("/a/b/../c", "/a/c");
+        assert_normalized_eq("/a/./b", "/a/b");
+        assert_normalized_eq("/a/b/..", "/a");
+    }
+
+    #[test]
+    fn normalize_makes_relative_paths_absolute() {
+        let n = normalize(Path::new("src/../README.md"));
+        assert!(n.is_absolute());
+        assert!(n.ends_with("README.md"));
+        assert!(!n.components().any(|c| c == Component::ParentDir));
+    }
+
+    #[test]
+    fn absolutize_canonicalizes_existing_paths() {
+        let tmp = std::env::temp_dir();
+        let n = absolutize(&tmp);
+        assert!(n.is_absolute());
+        assert!(!n.components().any(|c| c == Component::ParentDir));
+    }
+
+    #[test]
+    fn absolutize_normalizes_missing_paths() {
+        // Not canonicalizable (doesn't exist): should still come out absolute,
+        // and free of `..`/`.` components.
+        let n = absolutize(Path::new("/definitely/does/not/../exist.txt"));
+        assert_eq!(n, PathBuf::from("/definitely/does/exist.txt"));
+        assert!(!n.components().any(|c| c == Component::ParentDir));
+        assert!(!n.components().any(|c| c == Component::CurDir));
+    }
 }
