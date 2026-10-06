@@ -16,7 +16,8 @@ use agent_client_protocol::schema::v1::{
     InitializeRequest, NewSessionRequest, PermissionOptionId, PromptRequest, ReadTextFileRequest,
     ReadTextFileResponse, RequestPermissionOutcome, RequestPermissionRequest,
     RequestPermissionResponse, SelectedPermissionOutcome, SessionNotification, SessionUpdate,
-    StopReason, TextContent, ToolCallStatus, WriteTextFileRequest, WriteTextFileResponse,
+    StopReason, TextContent, ToolCallContent, ToolCallStatus, WriteTextFileRequest,
+    WriteTextFileResponse,
 };
 use agent_client_protocol::{AcpAgent, AcpAgentConfig, Agent, Client, ConnectionTo};
 use serde_json::{Value, json};
@@ -205,6 +206,10 @@ struct Captured {
     tool_calls: Vec<(String, ToolCallStatus)>,
     tool_updates: Vec<(String, ToolCallStatus)>,
     permission_requests: usize,
+    /// Paths of diffs attached to permission requests (ACP v1: must be absolute).
+    diff_paths: Vec<PathBuf>,
+    /// Tool calls seen as `session/update` ToolCall notifications: (title, locations).
+    tool_call_details: Vec<(String, Vec<PathBuf>)>,
 }
 
 /// What the fake user does when asked for permission.
@@ -292,6 +297,13 @@ impl Harness {
                         }
                         SessionUpdate::ToolCall(tc) => {
                             c.tool_calls.push((tc.title.clone(), tc.status));
+                            c.tool_call_details.push((
+                                tc.title.clone(),
+                                tc.locations
+                                    .iter()
+                                    .map(|l| l.path.clone())
+                                    .collect::<Vec<_>>(),
+                            ));
                         }
                         SessionUpdate::ToolCallUpdate(upd) => {
                             if let Some(status) = upd.fields.status {
@@ -307,7 +319,17 @@ impl Harness {
             )
             .on_receive_request(
                 async move |req: RequestPermissionRequest, responder, _cx| {
-                    captured.lock().unwrap().permission_requests += 1;
+                    {
+                        let mut c = captured.lock().unwrap();
+                        c.permission_requests += 1;
+                        // Record the diff paths shown with the permission prompt so
+                        // tests can assert the ACP v1 "absolute path" requirement.
+                        for content in req.tool_call.fields.content.iter().flatten() {
+                            if let ToolCallContent::Diff(d) = content {
+                                c.diff_paths.push(d.path.clone());
+                            }
+                        }
+                    }
                     let wanted = match policy {
                         PermissionPolicy::AllowAlways => "allow_always",
                         PermissionPolicy::RejectOnce => "reject_once",
@@ -638,7 +660,7 @@ async fn acp_fs_advertised_routes_through_client() {
         },
         fs_calls: Arc::default(),
     };
-    let (stop, captured) = harness
+    let (stop, _captured) = harness
         .run_prompt(&base_url, &workdir, "Read and write files")
         .await;
     assert_eq!(stop, StopReason::EndTurn);
@@ -762,6 +784,68 @@ async fn acp_fs_not_advertised_falls_back_to_local() {
     assert!(
         harness.fs_calls.writes.lock().unwrap().is_empty(),
         "agent sent fs/write_text_file despite no advertised fs capability"
+    );
+
+    std::fs::remove_dir_all(&workdir).ok();
+}
+
+/// ACP v1 requires absolute paths on every path the agent sends to the client:
+/// `ToolCallLocation.path`, `Diff.path`, `fs/read_text_file` and
+/// `fs/write_text_file` paths (spec: https://agentclientprotocol.com/protocol/v1).
+/// The model passes relative paths; the agent must absolutize them.
+#[tokio::test]
+async fn acp_tool_metadata_paths_are_absolute() {
+    let script = Script(vec![
+        Step::ToolCall {
+            name: "write_file",
+            arguments: json!({"path": "new/dir/created.txt", "content": "hi"}),
+        },
+        Step::Final("done"),
+    ]);
+    let stats = Arc::new(MockStats::default());
+    let base_url = start_mock_llm(script, stats).await;
+    let workdir = temp_workdir();
+
+    let harness = Harness {
+        captured: Arc::default(),
+        permission_policy: PermissionPolicy::AllowAlways,
+        fs_policy: FsPolicy::NotAdvertised,
+        fs_calls: Arc::default(),
+    };
+    let (stop, captured) = harness
+        .run_prompt(&base_url, &workdir, "Write a file")
+        .await;
+    assert_eq!(stop, StopReason::EndTurn);
+
+    let c = captured.lock().unwrap();
+    // ToolCallLocation.path must be absolute, even for a file that doesn't exist yet.
+    let locations = c
+        .tool_call_details
+        .iter()
+        .flat_map(|(_, locs)| locs.iter())
+        .collect::<Vec<_>>();
+    assert_eq!(locations.len(), 1, "write_file should report one location");
+    assert!(
+        locations[0].is_absolute(),
+        "ToolCallLocation.path must be absolute, got {}",
+        locations[0].display()
+    );
+    assert!(locations[0].ends_with("new/dir/created.txt"));
+
+    // Diff.path on the permission prompt must be absolute too.
+    assert_eq!(c.diff_paths.len(), 1, "write_file asks for permission once");
+    let diff = &c.diff_paths[0];
+    assert!(
+        diff.is_absolute(),
+        "Diff.path must be absolute, got {}",
+        diff.display()
+    );
+    assert!(diff.ends_with("new/dir/created.txt"));
+    drop(c);
+
+    assert_eq!(
+        std::fs::read_to_string(workdir.join("new/dir/created.txt")).unwrap(),
+        "hi"
     );
 
     std::fs::remove_dir_all(&workdir).ok();
