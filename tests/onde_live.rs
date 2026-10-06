@@ -35,8 +35,14 @@ fn onde_lists_models() {
         .expect("failed to run onde-code --list-models");
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(out.status.success(), "--list-models failed\nstdout: {stdout}\nstderr: {stderr}");
-    let ids: Vec<&str> = stdout.lines().map(|l| l.split('\t').next().unwrap()).collect();
+    assert!(
+        out.status.success(),
+        "--list-models failed\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    let ids: Vec<&str> = stdout
+        .lines()
+        .map(|l| l.split('\t').next().unwrap())
+        .collect();
     assert!(!ids.is_empty(), "endpoint returned no models");
     assert!(
         ids.iter().any(|id| id.starts_with("onde")),
@@ -51,8 +57,8 @@ fn onde_lists_models() {
 async fn onde_answers_prompt() {
     use agent_client_protocol::schema::ProtocolVersion;
     use agent_client_protocol::schema::v1::{
-        ContentBlock, InitializeRequest, NewSessionRequest, PromptRequest, RequestPermissionRequest,
-        SessionNotification, SessionUpdate, StopReason, TextContent,
+        ContentBlock, InitializeRequest, NewSessionRequest, PromptRequest,
+        RequestPermissionRequest, SessionNotification, SessionUpdate, StopReason, TextContent,
     };
     use agent_client_protocol::{AcpAgent, AcpAgentConfig, Agent, Client, ConnectionTo};
 
@@ -99,7 +105,9 @@ async fn onde_answers_prompt() {
                 let resp = connection
                     .send_request(PromptRequest::new(
                         session.session_id,
-                        vec![ContentBlock::Text(TextContent::new("Reply with exactly the word: ready"))],
+                        vec![ContentBlock::Text(TextContent::new(
+                            "Reply with exactly the word: ready",
+                        ))],
                     ))
                     .block_task()
                     .await?;

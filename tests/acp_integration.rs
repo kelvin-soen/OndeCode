@@ -40,7 +40,10 @@ struct MockStats {
 #[derive(Clone)]
 enum Step {
     /// Emit a tool call, then wait for the tool result.
-    ToolCall { name: &'static str, arguments: Value },
+    ToolCall {
+        name: &'static str,
+        arguments: Value,
+    },
     /// Emit final assistant text and finish.
     Final(&'static str),
 }
@@ -51,11 +54,18 @@ impl Script {
     fn step_for(&self, messages: &[Value]) -> Step {
         // Count completed tool results to know how far into the script we are.
         let done = messages.iter().filter(|m| m["role"] == "tool").count();
-        self.0.get(done).unwrap_or_else(|| self.0.last().expect("empty script")).clone()
+        self.0
+            .get(done)
+            .unwrap_or_else(|| self.0.last().expect("empty script"))
+            .clone()
     }
 }
 
-fn sse_chunk(content: Option<&str>, tool_call: Option<(&str, &str, &str)>, finish: Option<&str>) -> String {
+fn sse_chunk(
+    content: Option<&str>,
+    tool_call: Option<(&str, &str, &str)>,
+    finish: Option<&str>,
+) -> String {
     let mut delta = json!({});
     if let Some(c) = content {
         delta["content"] = json!(c);
@@ -129,18 +139,28 @@ async fn start_mock_llm(script: Script, stats: Arc<MockStats>) -> String {
 
                 // Assert the condense debug key headers made it through.
                 let lower = head.to_ascii_lowercase();
-                if lower.contains(&format!("x-condense-auth-token: {DEBUG_KEY}").to_ascii_lowercase()) {
+                if lower
+                    .contains(&format!("x-condense-auth-token: {DEBUG_KEY}").to_ascii_lowercase())
+                {
                     *stats.saw_condense_key.lock().unwrap() = true;
                 }
                 if lower.contains("x-condense-session-id:") {
                     *stats.saw_session_header.lock().unwrap() = true;
                 }
 
-                assert!(head.starts_with("POST /v1/chat/completions"), "unexpected request: {}", head.lines().next().unwrap_or(""));
+                assert!(
+                    head.starts_with("POST /v1/chat/completions"),
+                    "unexpected request: {}",
+                    head.lines().next().unwrap_or("")
+                );
                 let payload: Value = serde_json::from_str(&body).unwrap();
                 assert_eq!(payload["model"], "scripted-test-model");
                 assert_eq!(payload["stream"], true);
-                assert_eq!(payload["tools"].as_array().unwrap().len(), 5, "agent must expose 5 tools");
+                assert_eq!(
+                    payload["tools"].as_array().unwrap().len(),
+                    5,
+                    "agent must expose 5 tools"
+                );
 
                 let messages = payload["messages"].as_array().unwrap();
                 let step = Script(steps).step_for(messages);
@@ -148,7 +168,11 @@ async fn start_mock_llm(script: Script, stats: Arc<MockStats>) -> String {
                 let mut data = String::new();
                 match step {
                     Step::ToolCall { name, arguments } => {
-                        data.push_str(&sse_chunk(None, Some(("call_1", name, &arguments.to_string())), None));
+                        data.push_str(&sse_chunk(
+                            None,
+                            Some(("call_1", name, &arguments.to_string())),
+                            None,
+                        ));
                         data.push_str(&sse_chunk(None, None, Some("tool_calls")));
                     }
                     Step::Final(text) => {
@@ -201,7 +225,8 @@ impl Harness {
         script_workdir: &PathBuf,
         prompt: &str,
     ) -> (StopReason, Arc<Mutex<Captured>>) {
-        self.run_prompt_maybe_cancel(base_url, script_workdir, prompt, false).await
+        self.run_prompt_maybe_cancel(base_url, script_workdir, prompt, false)
+            .await
     }
 
     async fn run_prompt_maybe_cancel(
@@ -240,7 +265,8 @@ impl Harness {
                         }
                         SessionUpdate::ToolCallUpdate(upd) => {
                             if let Some(status) = upd.fields.status {
-                                c.tool_updates.push((upd.tool_call_id.0.to_string(), status));
+                                c.tool_updates
+                                    .push((upd.tool_call_id.0.to_string(), status));
                             }
                         }
                         _ => {}
@@ -261,7 +287,9 @@ impl Harness {
                         .options
                         .iter()
                         .find(|o| o.option_id.0.as_ref() == wanted)
-                        .unwrap_or_else(|| panic!("agent did not offer '{wanted}' option: {:?}", req.options));
+                        .unwrap_or_else(|| {
+                            panic!("agent did not offer '{wanted}' option: {:?}", req.options)
+                        });
                     responder.respond(RequestPermissionResponse::new(
                         RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(
                             PermissionOptionId::new(option.option_id.0.clone()),
@@ -326,28 +354,62 @@ fn temp_workdir() -> PathBuf {
 #[tokio::test]
 async fn acp_full_agent_loop_with_tools() {
     let script = Script(vec![
-        Step::ToolCall { name: "list_directory", arguments: json!({}) },
-        Step::ToolCall { name: "write_file", arguments: json!({"path": "hello.txt", "content": "hello from acp test"}) },
-        Step::ToolCall { name: "read_file", arguments: json!({"path": "hello.txt"}) },
-        Step::ToolCall { name: "run_command", arguments: json!({"command": "cat hello.txt"}) },
+        Step::ToolCall {
+            name: "list_directory",
+            arguments: json!({}),
+        },
+        Step::ToolCall {
+            name: "write_file",
+            arguments: json!({"path": "hello.txt", "content": "hello from acp test"}),
+        },
+        Step::ToolCall {
+            name: "read_file",
+            arguments: json!({"path": "hello.txt"}),
+        },
+        Step::ToolCall {
+            name: "run_command",
+            arguments: json!({"command": "cat hello.txt"}),
+        },
         Step::Final("Done: created hello.txt and verified its contents."),
     ]);
     let stats = Arc::new(MockStats::default());
     let base_url = start_mock_llm(script, stats.clone()).await;
     let workdir = temp_workdir();
 
-    let harness = Harness { captured: Arc::default(), permission_policy: PermissionPolicy::AllowAlways };
-    let (stop, captured) = harness.run_prompt(&base_url, &workdir, "Create hello.txt").await;
+    let harness = Harness {
+        captured: Arc::default(),
+        permission_policy: PermissionPolicy::AllowAlways,
+    };
+    let (stop, captured) = harness
+        .run_prompt(&base_url, &workdir, "Create hello.txt")
+        .await;
 
     assert_eq!(stop, StopReason::EndTurn);
     let c = captured.lock().unwrap();
-    assert!(c.text.contains("Done: created hello.txt"), "streamed text missing: {}", c.text);
-    // 4 tool calls started; the 2 writes asked for permission (reads/list don't).
-    assert_eq!(c.tool_calls.len(), 4, "tool call notifications: {:?}", c.tool_calls);
-    assert_eq!(c.permission_requests, 2, "write_file + run_command should each ask once");
     assert!(
-        c.tool_updates.iter().filter(|(_, s)| *s == ToolCallStatus::Completed).count() == 4,
-        "all 4 tools should complete: {:?}", c.tool_updates
+        c.text.contains("Done: created hello.txt"),
+        "streamed text missing: {}",
+        c.text
+    );
+    // 4 tool calls started; the 2 writes asked for permission (reads/list don't).
+    assert_eq!(
+        c.tool_calls.len(),
+        4,
+        "tool call notifications: {:?}",
+        c.tool_calls
+    );
+    assert_eq!(
+        c.permission_requests, 2,
+        "write_file + run_command should each ask once"
+    );
+    assert!(
+        c.tool_updates
+            .iter()
+            .filter(|(_, s)| *s == ToolCallStatus::Completed)
+            .count()
+            == 4,
+        "all 4 tools should complete: {:?}",
+        c.tool_updates
     );
     drop(c);
 
@@ -357,8 +419,14 @@ async fn acp_full_agent_loop_with_tools() {
 
     // The mock endpoint saw the condense debug key on every request.
     assert!(stats.requests.load(Ordering::SeqCst) >= 5);
-    assert!(*stats.saw_condense_key.lock().unwrap(), "X-Condense-Auth-Token header missing");
-    assert!(*stats.saw_session_header.lock().unwrap(), "X-Condense-Session-Id header missing");
+    assert!(
+        *stats.saw_condense_key.lock().unwrap(),
+        "X-Condense-Auth-Token header missing"
+    );
+    assert!(
+        *stats.saw_session_header.lock().unwrap(),
+        "X-Condense-Session-Id header missing"
+    );
 
     std::fs::remove_dir_all(&workdir).ok();
 }
@@ -368,22 +436,39 @@ async fn acp_full_agent_loop_with_tools() {
 #[tokio::test]
 async fn acp_permission_rejection_blocks_write() {
     let script = Script(vec![
-        Step::ToolCall { name: "write_file", arguments: json!({"path": "nope.txt", "content": "should not exist"}) },
+        Step::ToolCall {
+            name: "write_file",
+            arguments: json!({"path": "nope.txt", "content": "should not exist"}),
+        },
         Step::Final("Understood, I won't create the file."),
     ]);
     let stats = Arc::new(MockStats::default());
     let base_url = start_mock_llm(script, stats).await;
     let workdir = temp_workdir();
 
-    let harness = Harness { captured: Arc::default(), permission_policy: PermissionPolicy::RejectOnce };
-    let (stop, captured) = harness.run_prompt(&base_url, &workdir, "Create nope.txt").await;
+    let harness = Harness {
+        captured: Arc::default(),
+        permission_policy: PermissionPolicy::RejectOnce,
+    };
+    let (stop, captured) = harness
+        .run_prompt(&base_url, &workdir, "Create nope.txt")
+        .await;
 
     assert_eq!(stop, StopReason::EndTurn);
     let c = captured.lock().unwrap();
     assert_eq!(c.permission_requests, 1);
-    assert!(c.tool_updates.iter().any(|(_, s)| *s == ToolCallStatus::Failed), "rejected write must fail: {:?}", c.tool_updates);
+    assert!(
+        c.tool_updates
+            .iter()
+            .any(|(_, s)| *s == ToolCallStatus::Failed),
+        "rejected write must fail: {:?}",
+        c.tool_updates
+    );
     drop(c);
-    assert!(!workdir.join("nope.txt").exists(), "rejected write must not touch disk");
+    assert!(
+        !workdir.join("nope.txt").exists(),
+        "rejected write must not touch disk"
+    );
 
     std::fs::remove_dir_all(&workdir).ok();
 }
@@ -396,8 +481,13 @@ async fn acp_plain_text_turn() {
     let base_url = start_mock_llm(script, stats).await;
     let workdir = temp_workdir();
 
-    let harness = Harness { captured: Arc::default(), permission_policy: PermissionPolicy::AllowAlways };
-    let (stop, captured) = harness.run_prompt(&base_url, &workdir, "What is the answer?").await;
+    let harness = Harness {
+        captured: Arc::default(),
+        permission_policy: PermissionPolicy::AllowAlways,
+    };
+    let (stop, captured) = harness
+        .run_prompt(&base_url, &workdir, "What is the answer?")
+        .await;
 
     assert_eq!(stop, StopReason::EndTurn);
     let c = captured.lock().unwrap();
@@ -413,14 +503,20 @@ async fn acp_plain_text_turn() {
 #[tokio::test]
 async fn acp_cancel_stops_turn() {
     let script = Script(vec![
-        Step::ToolCall { name: "run_command", arguments: json!({"command": "sleep 30"}) },
+        Step::ToolCall {
+            name: "run_command",
+            arguments: json!({"command": "sleep 30"}),
+        },
         Step::Final("should never get here"),
     ]);
     let stats = Arc::new(MockStats::default());
     let base_url = start_mock_llm(script, stats).await;
     let workdir = temp_workdir();
 
-    let harness = Harness { captured: Arc::default(), permission_policy: PermissionPolicy::AllowAlways };
+    let harness = Harness {
+        captured: Arc::default(),
+        permission_policy: PermissionPolicy::AllowAlways,
+    };
     let (stop, _captured) = harness
         .run_prompt_maybe_cancel(&base_url, &workdir, "Run a long command", true)
         .await;
