@@ -143,7 +143,9 @@ pub fn describe(
     let path = args
         .get("path")
         .and_then(Value::as_str)
-        .map(|p| resolve_in(&base, p));
+        .map(|p| resolve_in(&base, p))
+        // ACP v1: ToolCallLocation.path must be an absolute path.
+        .map(|p| absolutize(&p));
     let loc = path
         .clone()
         .map(ToolCallLocation::new)
@@ -332,7 +334,8 @@ impl ToolCtx {
         let a: WriteArgs = serde_json::from_value(args)?;
         let path = self.resolve_with(a.root.as_deref(), &a.path)?;
         let old = self.read_existing(&path).await?;
-        let diff = Diff::new(path.clone(), a.content.clone()).old_text(old);
+        // ACP v1: Diff.path must be an absolute file path.
+        let diff = Diff::new(absolutize(&path), a.content.clone()).old_text(old);
         self.apply_edit(id, "write_file", &path, &a.content, diff)
             .await
     }
@@ -353,7 +356,8 @@ impl ToolCtx {
             ),
         }
         let new = old.replacen(&a.old_string, &a.new_string, 1);
-        let diff = Diff::new(path.clone(), new.clone()).old_text(old);
+        // ACP v1: Diff.path must be an absolute file path.
+        let diff = Diff::new(absolutize(&path), new.clone()).old_text(old);
         self.apply_edit(id, "edit_file", &path, &new, diff).await
     }
 
@@ -420,7 +424,8 @@ impl ToolCtx {
         let sid = self.session_id.clone();
         let req = CreateTerminalRequest::new(sid.clone(), "sh")
             .args(vec!["-c".into(), command.into()])
-            .cwd(cwd.to_path_buf())
+            // ACP v1: the terminal cwd must be an absolute path.
+            .cwd(absolutize(cwd))
             .output_byte_limit(MAX_OUTPUT_BYTES as u64);
         let terminal_id = self
             .connection
@@ -571,11 +576,11 @@ fn resolve_in(base: &Path, path: &str) -> PathBuf {
     }
 }
 
-/// Make `path` absolute and free of `.`/`..` components, as the ACP v1 fs methods
-/// require an absolute path. Existing paths are canonicalized (resolving symlinks
+/// Make `path` absolute and free of `.`/`..` components, as the ACP v1 spec requires
+/// absolute paths everywhere. Existing paths are canonicalized (resolving symlinks
 /// and giving the client the true on-disk location); paths that don't exist yet
 /// are normalized lexically with the existing parent canonicalized when possible.
-fn absolutize(path: &Path) -> PathBuf {
+pub(crate) fn absolutize(path: &Path) -> PathBuf {
     if let Ok(c) = std::fs::canonicalize(path) {
         return c;
     }

@@ -225,6 +225,10 @@ impl CoderAgent {
     }
 
     async fn new_session(&self, cwd: PathBuf, roots: Vec<PathBuf>) -> NewSessionResponse {
+        // ACP v1: `cwd` and additional directories must be absolute paths. Normalize
+        // defensively so a sloppy client can't bind the session to a relative path.
+        let cwd = tools::absolutize(&cwd);
+        let roots: Vec<PathBuf> = roots.into_iter().map(|r| tools::absolutize(&r)).collect();
         let id = SessionId::new(uuid::Uuid::new_v4().to_string());
         let model = self.llm.model().to_string();
         let options = self.config_options(&model).await;
@@ -354,9 +358,13 @@ impl CoderAgent {
                 agent_client_protocol::Error::invalid_params()
                     .data(format!("unknown session {session_id}"))
             })?;
-            s.cwd = req.cwd;
+            s.cwd = tools::absolutize(&req.cwd);
             if !req.additional_directories.is_empty() {
-                s.roots = req.additional_directories;
+                s.roots = req
+                    .additional_directories
+                    .into_iter()
+                    .map(|r| tools::absolutize(&r))
+                    .collect();
             }
             s.updated_at = now_secs();
             s.model.clone()
