@@ -12,10 +12,11 @@ use std::sync::{Arc, Mutex};
 
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
-    CancelNotification, ContentBlock, InitializeRequest, NewSessionRequest, PermissionOptionId,
-    PromptRequest, RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
-    SelectedPermissionOutcome, SessionNotification, SessionUpdate, StopReason, TextContent,
-    ToolCallStatus,
+    CancelNotification, ClientCapabilities, ContentBlock, FileSystemCapabilities,
+    InitializeRequest, NewSessionRequest, PermissionOptionId, PromptRequest, ReadTextFileRequest,
+    ReadTextFileResponse, RequestPermissionOutcome, RequestPermissionRequest,
+    RequestPermissionResponse, SelectedPermissionOutcome, SessionNotification, SessionUpdate,
+    StopReason, TextContent, ToolCallStatus, WriteTextFileRequest, WriteTextFileResponse,
 };
 use agent_client_protocol::{AcpAgent, AcpAgentConfig, Agent, Client, ConnectionTo};
 use serde_json::{Value, json};
@@ -213,9 +214,30 @@ enum PermissionPolicy {
     RejectOnce,
 }
 
+/// Whether the fake client advertises the ACP v1 fs methods, and what its
+/// `fs/read_text_file` should serve.
+#[derive(Clone, Default)]
+enum FsPolicy {
+    /// No fs capabilities: the agent MUST fall back to the local filesystem and
+    /// MUST NOT send fs/* requests (spec: https://agentclientprotocol.com/protocol/v1/file-system).
+    #[default]
+    NotAdvertised,
+    /// Advertise readTextFile/writeTextFile and serve `content` for every read.
+    Advertise { content: String },
+}
+
+/// Records what fs methods the fake client received, if any.
+#[derive(Debug, Default)]
+struct FsCalls {
+    reads: Mutex<Vec<(PathBuf, Option<u32>, Option<u32>)>>,
+    writes: Mutex<Vec<(PathBuf, String)>>,
+}
+
 struct Harness {
     captured: Arc<Mutex<Captured>>,
     permission_policy: PermissionPolicy,
+    fs_policy: FsPolicy,
+    fs_calls: Arc<FsCalls>,
 }
 
 impl Harness {
@@ -246,6 +268,14 @@ impl Harness {
         let captured = self.captured.clone();
         let captured_notify = captured.clone();
         let policy = self.permission_policy;
+        let fs_calls = self.fs_calls.clone();
+        // Owned per-connection values: what fs capabilities to advertise, and what
+        // the fake fs/read_text_file should serve.
+        let advertise_fs = matches!(self.fs_policy, FsPolicy::Advertise { .. });
+        let serve_content = match &self.fs_policy {
+            FsPolicy::Advertise { content } => content.clone(),
+            FsPolicy::NotAdvertised => String::new(),
+        };
         let workdir = workdir.clone();
         let prompt = prompt.to_string();
 
@@ -298,9 +328,48 @@ impl Harness {
                 },
                 agent_client_protocol::on_receive_request!(),
             )
+            .on_receive_request(
+                {
+                    let fs_calls = fs_calls.clone();
+                    let serve_content = serve_content.clone();
+                    async move |req: ReadTextFileRequest, responder, _cx| {
+                        fs_calls.reads.lock().unwrap().push((
+                            req.path.clone(),
+                            req.line,
+                            req.limit,
+                        ));
+                        responder.respond(ReadTextFileResponse::new(serve_content.clone()))
+                    }
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                {
+                    let fs_calls = fs_calls.clone();
+                    async move |req: WriteTextFileRequest, responder, _cx| {
+                        fs_calls
+                            .writes
+                            .lock()
+                            .unwrap()
+                            .push((req.path.clone(), req.content.clone()));
+                        responder.respond(WriteTextFileResponse::new())
+                    }
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
             .connect_with(agent, |connection: ConnectionTo<Agent>| async move {
                 let init = connection
-                    .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .send_request(
+                        InitializeRequest::new(ProtocolVersion::V1).client_capabilities(
+                            ClientCapabilities::new().fs(if advertise_fs {
+                                FileSystemCapabilities::new()
+                                    .read_text_file(true)
+                                    .write_text_file(true)
+                            } else {
+                                FileSystemCapabilities::new()
+                            }),
+                        ),
+                    )
                     .block_task()
                     .await?;
                 let agent_info = init.agent_info.expect("agent must report its info");
@@ -379,6 +448,8 @@ async fn acp_full_agent_loop_with_tools() {
     let harness = Harness {
         captured: Arc::default(),
         permission_policy: PermissionPolicy::AllowAlways,
+        fs_policy: FsPolicy::NotAdvertised,
+        fs_calls: Arc::default(),
     };
     let (stop, captured) = harness
         .run_prompt(&base_url, &workdir, "Create hello.txt")
@@ -449,6 +520,8 @@ async fn acp_permission_rejection_blocks_write() {
     let harness = Harness {
         captured: Arc::default(),
         permission_policy: PermissionPolicy::RejectOnce,
+        fs_policy: FsPolicy::NotAdvertised,
+        fs_calls: Arc::default(),
     };
     let (stop, captured) = harness
         .run_prompt(&base_url, &workdir, "Create nope.txt")
@@ -484,6 +557,8 @@ async fn acp_plain_text_turn() {
     let harness = Harness {
         captured: Arc::default(),
         permission_policy: PermissionPolicy::AllowAlways,
+        fs_policy: FsPolicy::NotAdvertised,
+        fs_calls: Arc::default(),
     };
     let (stop, captured) = harness
         .run_prompt(&base_url, &workdir, "What is the answer?")
@@ -516,12 +591,178 @@ async fn acp_cancel_stops_turn() {
     let harness = Harness {
         captured: Arc::default(),
         permission_policy: PermissionPolicy::AllowAlways,
+        fs_policy: FsPolicy::NotAdvertised,
+        fs_calls: Arc::default(),
     };
     let (stop, _captured) = harness
         .run_prompt_maybe_cancel(&base_url, &workdir, "Run a long command", true)
         .await;
 
     assert_eq!(stop, StopReason::Cancelled);
+
+    std::fs::remove_dir_all(&workdir).ok();
+}
+
+// ---------------------------------------------------------------------------
+// ACP v1 fs routing (https://agentclientprotocol.com/protocol/v1/file-system)
+// ---------------------------------------------------------------------------
+
+/// When the client advertises fs.readTextFile/writeTextFile, the agent must
+/// route reads and writes through the client instead of the local filesystem:
+/// the read returns the client-served (e.g. unsaved-buffer) content, and the
+/// write lands as an fs/write_text_file request with an absolute path.
+#[tokio::test]
+async fn acp_fs_advertised_routes_through_client() {
+    let script = Script(vec![
+        Step::ToolCall {
+            name: "read_file",
+            arguments: json!({"path": "buffer.txt"}),
+        },
+        Step::ToolCall {
+            name: "write_file",
+            arguments: json!({"path": "out.txt", "content": "written via client"}),
+        },
+        Step::Final("done"),
+    ]);
+    let stats = Arc::new(MockStats::default());
+    let base_url = start_mock_llm(script, stats).await;
+    let workdir = temp_workdir();
+    // Disk content differs from what the client serves, like an unsaved buffer.
+    std::fs::write(workdir.join("buffer.txt"), "stale on-disk content").unwrap();
+
+    let harness = Harness {
+        captured: Arc::default(),
+        permission_policy: PermissionPolicy::AllowAlways,
+        fs_policy: FsPolicy::Advertise {
+            content: "live buffer content".to_string(),
+        },
+        fs_calls: Arc::default(),
+    };
+    let (stop, captured) = harness
+        .run_prompt(&base_url, &workdir, "Read and write files")
+        .await;
+    assert_eq!(stop, StopReason::EndTurn);
+
+    let f = harness.fs_calls;
+    let reads = f.reads.lock().unwrap();
+    assert_eq!(
+        reads.len(),
+        2,
+        "read_file on buffer.txt + write_file's diff pre-read of out.txt: {:?}",
+        reads
+    );
+    for (path, _line, _limit) in reads.iter() {
+        assert!(
+            path.is_absolute(),
+            "fs/read_text_file path must be absolute, got {}",
+            path.display()
+        );
+    }
+    // The model's read_file went to buffer.txt, canonicalized to its true path.
+    assert_eq!(
+        reads[0].0,
+        workdir.join("buffer.txt").canonicalize().unwrap()
+    );
+    // write_file's diff pre-read went to the not-yet-existing out.txt, absolutized.
+    assert!(reads[1].0.ends_with("out.txt"));
+
+    let writes = f.writes.lock().unwrap();
+    assert_eq!(writes.len(), 1);
+    let (path, content) = &writes[0];
+    assert!(
+        path.is_absolute(),
+        "fs/write_text_file path must be absolute, got {}",
+        path.display()
+    );
+    assert!(path.ends_with("out.txt"));
+    assert_eq!(content, "written via client");
+
+    // The agent must NOT have written to the local filesystem directly: with
+    // fs.writeTextFile advertised, the write went through the client.
+    assert!(
+        !workdir.join("out.txt").exists(),
+        "agent wrote to local fs despite advertising fs.writeTextFile"
+    );
+
+    std::fs::remove_dir_all(&workdir).ok();
+}
+
+/// The read_file result fed back to the model must be the client-served
+/// content, proving the agent read through fs/read_text_file rather than disk.
+#[tokio::test]
+async fn acp_fs_read_uses_client_content_in_conversation() {
+    let script = Script(vec![
+        Step::ToolCall {
+            name: "read_file",
+            arguments: json!({"path": "buffer.txt", "line": 1, "limit": 5}),
+        },
+        Step::Final("done"),
+    ]);
+    let stats = Arc::new(MockStats::default());
+    let base_url = start_mock_llm(script, stats).await;
+    let workdir = temp_workdir();
+    std::fs::write(
+        workdir.join("buffer.txt"),
+        "one\ntwo\nthree\nfour\nfive\nsix\n",
+    )
+    .unwrap();
+
+    let harness = Harness {
+        captured: Arc::default(),
+        permission_policy: PermissionPolicy::AllowAlways,
+        fs_policy: FsPolicy::Advertise {
+            content: "client-served line".to_string(),
+        },
+        fs_calls: Arc::default(),
+    };
+    let (stop, _captured) = harness.run_prompt(&base_url, &workdir, "Read a file").await;
+    assert_eq!(stop, StopReason::EndTurn);
+
+    let reads = harness.fs_calls.reads.lock().unwrap();
+    assert_eq!(reads.len(), 1);
+    let (path, line, limit) = &reads[0];
+    assert!(path.is_absolute());
+    assert_eq!(*line, Some(1), "1-based `line` must be forwarded");
+    assert_eq!(*limit, Some(5), "`limit` must be forwarded");
+
+    std::fs::remove_dir_all(&workdir).ok();
+}
+
+/// With fs capabilities absent, the agent MUST NOT send any fs/* requests
+/// (spec: "If readTextFile or writeTextFile is false or not present, the Agent
+/// MUST NOT attempt to call the corresponding filesystem method") and must fall
+/// back to the local filesystem.
+#[tokio::test]
+async fn acp_fs_not_advertised_falls_back_to_local() {
+    let script = Script(vec![
+        Step::ToolCall {
+            name: "read_file",
+            arguments: json!({"path": "hello.txt"}),
+        },
+        Step::Final("done"),
+    ]);
+    let stats = Arc::new(MockStats::default());
+    let base_url = start_mock_llm(script, stats).await;
+    let workdir = temp_workdir();
+    std::fs::write(workdir.join("hello.txt"), "local content").unwrap();
+
+    let harness = Harness {
+        captured: Arc::default(),
+        permission_policy: PermissionPolicy::AllowAlways,
+        fs_policy: FsPolicy::NotAdvertised,
+        fs_calls: Arc::default(),
+    };
+    let (stop, _captured) = harness.run_prompt(&base_url, &workdir, "Read a file").await;
+    assert_eq!(stop, StopReason::EndTurn);
+
+    assert!(
+        harness.fs_calls.reads.lock().unwrap().is_empty(),
+        "agent sent fs/read_text_file despite no advertised fs capability"
+    );
+    assert!(
+        harness.fs_calls.writes.lock().unwrap().is_empty(),
+        "agent sent fs/write_text_file despite no advertised fs capability"
+    );
 
     std::fs::remove_dir_all(&workdir).ok();
 }
