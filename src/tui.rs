@@ -7,10 +7,12 @@ use std::time::Duration;
 
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
-    CancelNotification, ContentBlock, InitializeRequest, NewSessionRequest, PermissionOptionKind,
-    PromptRequest, RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
-    SelectedPermissionOutcome, SessionId, SessionNotification, SessionUpdate, StopReason,
-    TextContent, ToolCallContent, ToolCallId, ToolCallStatus,
+    CancelNotification, ClientCapabilities, ContentBlock, FileSystemCapabilities,
+    InitializeRequest, NewSessionRequest, PermissionOptionKind, PromptRequest, ReadTextFileRequest,
+    ReadTextFileResponse, RequestPermissionOutcome, RequestPermissionRequest,
+    RequestPermissionResponse, SelectedPermissionOutcome, SessionId, SessionNotification,
+    SessionUpdate, StopReason, TextContent, ToolCallContent, ToolCallId, ToolCallStatus,
+    WriteTextFileRequest, WriteTextFileResponse,
 };
 use agent_client_protocol::{AcpAgent, AcpAgentConfig, Agent, ConnectionTo};
 use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -74,12 +76,53 @@ pub async fn run(yolo: bool, extra_roots: Vec<PathBuf>) -> anyhow::Result<()> {
             },
             agent_client_protocol::on_receive_request!(),
         )
+        // ACP v1 fs/read_text_file: serve file contents from the session cwd,
+        // honoring the optional 1-based `line` and `limit` params.
+        .on_receive_request(
+            async move |req: ReadTextFileRequest, responder, _cx| match tokio::task::spawn_blocking(
+                {
+                    let path = req.path.clone();
+                    move || read_text_file_blocking(&path, req.line, req.limit)
+                },
+            )
+            .await
+            {
+                Ok(Ok(r)) => responder.respond(r),
+                Ok(Err(e)) => responder.respond_with_error(e),
+                Err(e) => responder.respond_with_internal_error(e.to_string()),
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        // ACP v1 fs/write_text_file: the client MUST create the file (and parent
+        // directories) if it doesn't exist.
+        .on_receive_request(
+            async move |req: WriteTextFileRequest, responder, _cx| {
+                match tokio::task::spawn_blocking({
+                    let path = req.path.clone();
+                    let content = req.content.clone();
+                    move || write_text_file_blocking(&path, &content)
+                })
+                .await
+                {
+                    Ok(Ok(r)) => responder.respond(r),
+                    Ok(Err(e)) => responder.respond_with_error(e),
+                    Err(e) => responder.respond_with_internal_error(e.to_string()),
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
         .connect_with(
             AcpAgent::new(config),
             |conn: ConnectionTo<Agent>| async move {
-                conn.send_request(InitializeRequest::new(ProtocolVersion::V1))
-                    .block_task()
-                    .await?;
+                conn.send_request(
+                    InitializeRequest::new(ProtocolVersion::V1).client_capabilities(
+                        ClientCapabilities::new().fs(FileSystemCapabilities::new()
+                            .read_text_file(true)
+                            .write_text_file(true)),
+                    ),
+                )
+                .block_task()
+                .await?;
                 let session = conn
                     .send_request(
                         NewSessionRequest::new(cwd.clone())
@@ -98,6 +141,97 @@ pub async fn run(yolo: bool, extra_roots: Vec<PathBuf>) -> anyhow::Result<()> {
         )
         .await?;
     Ok(())
+}
+
+/// `fs/read_text_file` handler body: reads `path`, applying the spec's optional
+/// 1-based `line` and `limit` params.
+fn read_text_file_blocking(
+    path: &Path,
+    line: Option<u32>,
+    limit: Option<u32>,
+) -> agent_client_protocol::Result<ReadTextFileResponse> {
+    let content = std::fs::read_to_string(path).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            agent_client_protocol::Error::resource_not_found(Some(path.display().to_string()))
+        } else {
+            agent_client_protocol::Error::internal_error().data(e.to_string())
+        }
+    })?;
+    let skip = line.map_or(0, |l| l.saturating_sub(1) as usize);
+    let take = limit.map_or(usize::MAX, |l| l as usize);
+    let content = content
+        .lines()
+        .skip(skip)
+        .take(take)
+        .collect::<Vec<_>>()
+        .join("\n");
+    Ok(ReadTextFileResponse::new(content))
+}
+
+/// `fs/write_text_file` handler body: the client MUST create the file if it
+/// doesn't exist (spec: https://agentclientprotocol.com/protocol/v1/file-system).
+fn write_text_file_blocking(
+    path: &Path,
+    content: &str,
+) -> agent_client_protocol::Result<WriteTextFileResponse> {
+    let write = || {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(path, content)
+    };
+    write().map_err(|e| agent_client_protocol::Error::internal_error().data(e.to_string()))?;
+    Ok(WriteTextFileResponse::new())
+}
+
+#[cfg(test)]
+mod fs_handler_tests {
+    use super::*;
+
+    #[test]
+    fn read_text_file_slices_by_1_based_line_and_limit() {
+        let dir = std::env::temp_dir().join("onde-code-tui-fs-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("lines.txt");
+        std::fs::write(&file, "one\ntwo\nthree\nfour\n").unwrap();
+
+        let all = read_text_file_blocking(&file, None, None).unwrap();
+        assert_eq!(all.content, "one\ntwo\nthree\nfour");
+
+        let from_line = read_text_file_blocking(&file, Some(2), None).unwrap();
+        assert_eq!(from_line.content, "two\nthree\nfour");
+
+        let limited = read_text_file_blocking(&file, Some(2), Some(1)).unwrap();
+        assert_eq!(limited.content, "two");
+
+        let past_end = read_text_file_blocking(&file, Some(99), None).unwrap();
+        assert_eq!(past_end.content, "");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn read_text_file_missing_is_resource_not_found() {
+        let err = read_text_file_blocking(Path::new("/definitely/does/not/exist.txt"), None, None)
+            .unwrap_err();
+        assert_eq!(err.code, agent_client_protocol::ErrorCode::ResourceNotFound);
+    }
+
+    #[test]
+    fn write_text_file_creates_missing_file_and_parents() {
+        let dir = std::env::temp_dir()
+            .join("onde-code-tui-fs-test-2")
+            .join("nested");
+        let file = dir.join("created.txt");
+        write_text_file_blocking(&file, "hello").unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "hello");
+
+        // Overwrite existing.
+        write_text_file_blocking(&file, "again").unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "again");
+
+        std::fs::remove_dir_all(dir.parent().unwrap()).ok();
+    }
 }
 
 enum Entry {
