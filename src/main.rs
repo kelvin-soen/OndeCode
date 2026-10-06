@@ -23,10 +23,10 @@ use agent_client_protocol::schema::v1::{
     NewSessionRequest, NewSessionResponse, PromptCapabilities, PromptRequest, PromptResponse,
     ResumeSessionRequest, ResumeSessionResponse, SessionAdditionalDirectoriesCapabilities,
     SessionCapabilities, SessionCloseCapabilities, SessionConfigOption,
-    SessionConfigOptionCategory, SessionConfigSelectOption, SessionConfigSelectOptions,
-    SessionId, SessionInfo, SessionListCapabilities, SessionNotification,
-    SessionResumeCapabilities, SessionUpdate, SetSessionConfigOptionRequest,
-    SetSessionConfigOptionResponse, StopReason, ToolCall, ToolCallStatus, ToolCallUpdateFields,
+    SessionConfigOptionCategory, SessionConfigSelectOption, SessionConfigSelectOptions, SessionId,
+    SessionInfo, SessionListCapabilities, SessionNotification, SessionResumeCapabilities,
+    SessionUpdate, SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, StopReason,
+    ToolCall, ToolCallStatus, ToolCallUpdateFields,
 };
 use agent_client_protocol::{Agent, Client, ConnectionTo, Responder, Stdio};
 use anyhow::Context;
@@ -103,6 +103,8 @@ fn iso8601(secs: u64) -> String {
 struct CoderAgent {
     llm: LlmClient,
     yolo: bool,
+    /// How the agent was launched: `tui` (interactive terminal UI) or `acp` (editor).
+    surface: &'static str,
     client_caps: Arc<Mutex<ClientCapabilities>>,
     sessions: Arc<Mutex<HashMap<SessionId, Session>>>,
     /// Models offered for selection, fetched from `GET /models` on first use.
@@ -137,8 +139,10 @@ impl CoderAgent {
              edit_file for small changes, and run commands to build or test your work. Keep \
              answers concise and use Markdown.\n\
              When creating git commits, include the trailer:\n\
-             Co-Authored-By: OndeCode <noreply@ondeinference.com>",
-            cwd.display()
+             Co-Authored-By: OndeCode v{version}-{surface} <noreply@ondeinference.com>",
+            cwd.display(),
+            version = env!("CARGO_PKG_VERSION"),
+            surface = self.surface,
         )
     }
 
@@ -276,10 +280,10 @@ impl CoderAgent {
         let session_id = req.session_id.clone();
         let (model, messages) = {
             let sessions = self.sessions.lock().unwrap();
-            let s = sessions
-                .get(&session_id)
-                .ok_or_else(|| agent_client_protocol::Error::invalid_params()
-                    .data(format!("unknown session {session_id}")))?;
+            let s = sessions.get(&session_id).ok_or_else(|| {
+                agent_client_protocol::Error::invalid_params()
+                    .data(format!("unknown session {session_id}"))
+            })?;
             (s.model.clone(), s.messages.clone())
         };
         let notify = |update: SessionUpdate| {
@@ -346,10 +350,10 @@ impl CoderAgent {
         let session_id = req.session_id.clone();
         let model = {
             let mut sessions = self.sessions.lock().unwrap();
-            let s = sessions
-                .get_mut(&session_id)
-                .ok_or_else(|| agent_client_protocol::Error::invalid_params()
-                    .data(format!("unknown session {session_id}")))?;
+            let s = sessions.get_mut(&session_id).ok_or_else(|| {
+                agent_client_protocol::Error::invalid_params()
+                    .data(format!("unknown session {session_id}"))
+            })?;
             s.cwd = req.cwd;
             if !req.additional_directories.is_empty() {
                 s.roots = req.additional_directories;
@@ -362,7 +366,10 @@ impl CoderAgent {
     }
 
     /// Cancel any in-progress work and remove the session. Called by `session/close`.
-    fn close_session(&self, req: CloseSessionRequest) -> agent_client_protocol::Result<CloseSessionResponse> {
+    fn close_session(
+        &self,
+        req: CloseSessionRequest,
+    ) -> agent_client_protocol::Result<CloseSessionResponse> {
         let session_id = req.session_id.clone();
         let removed = self.sessions.lock().unwrap().remove(&session_id);
         if removed.is_none() {
@@ -565,7 +572,8 @@ fn prompt_to_content(blocks: &[ContentBlock]) -> Value {
         match block {
             ContentBlock::Text(t) => parts.push(json!({ "type": "text", "text": t.text })),
             ContentBlock::ResourceLink(link) => {
-                parts.push(json!({ "type": "text", "text": format!("[Referenced: {}]", link.uri) }));
+                parts
+                    .push(json!({ "type": "text", "text": format!("[Referenced: {}]", link.uri) }));
             }
             ContentBlock::Resource(res) => {
                 if let EmbeddedResourceResource::TextResourceContents(r) = &res.resource {
@@ -733,6 +741,16 @@ async fn list_models() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// How the agent was launched: `tui` (interactive terminal UI) or `acp` (editor).
+/// The TUI sets `ONDE_CODE_SURFACE=tui` on its subprocess; editors launch `--acp`
+/// directly so the default is `acp`.
+fn surface() -> &'static str {
+    match std::env::var("ONDE_CODE_SURFACE") {
+        Ok(s) if s == "tui" => "tui",
+        _ => "acp",
+    }
+}
+
 async fn run_agent(yolo_flag: bool) -> agent_client_protocol::Result<()> {
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
@@ -742,6 +760,7 @@ async fn run_agent(yolo_flag: bool) -> agent_client_protocol::Result<()> {
     let agent = CoderAgent {
         llm: LlmClient::new(LlmConfig::from_env()),
         yolo: yolo_flag || std::env::var("ONDE_CODE_YOLO").is_ok_and(|v| v == "1" || v == "true"),
+        surface: surface(),
         client_caps: Arc::default(),
         sessions: Arc::default(),
         models: Arc::default(),
@@ -846,11 +865,10 @@ async fn run_agent(yolo_flag: bool) -> agent_client_protocol::Result<()> {
         .on_receive_request(
             {
                 let agent = agent.clone();
-                async move |req: CloseSessionRequest, responder, _cx| {
-                    match agent.close_session(req) {
-                        Ok(resp) => responder.respond(resp),
-                        Err(e) => responder.respond_with_error(e),
-                    }
+                async move |req: CloseSessionRequest, responder, _cx| match agent.close_session(req)
+                {
+                    Ok(resp) => responder.respond(resp),
+                    Err(e) => responder.respond_with_error(e),
                 }
             },
             agent_client_protocol::on_receive_request!(),
