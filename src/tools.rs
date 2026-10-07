@@ -21,7 +21,14 @@ use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
 const MAX_OUTPUT_BYTES: usize = 32 * 1024;
-const COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
+
+fn command_timeout() -> Duration {
+    std::env::var("ONDE_CODE_COMMAND_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(Duration::from_secs(120))
+}
 
 /// Everything a tool needs to act on behalf of one session.
 pub struct ToolCtx {
@@ -465,9 +472,10 @@ impl ToolCtx {
                 terminal_id.clone(),
             ))
             .block_task();
+        let timeout = command_timeout();
         let exit = tokio::select! {
             r = wait => Some(r?.exit_status),
-            () = tokio::time::sleep(COMMAND_TIMEOUT) => None,
+            () = tokio::time::sleep(timeout) => None,
             () = self.cancel.cancelled() => None,
         };
         if exit.is_none() {
@@ -495,7 +503,7 @@ impl ToolCtx {
                 _ => "exited".into(),
             },
             None if self.cancel.is_cancelled() => "cancelled".into(),
-            None => format!("timed out after {}s", COMMAND_TIMEOUT.as_secs()),
+            None => format!("timed out after {}s", timeout.as_secs()),
         };
         let failed = !matches!(exit.as_ref().and_then(|s| s.exit_code), Some(0));
         let trunc = if output.truncated {
@@ -518,10 +526,11 @@ impl ToolCtx {
             .stdin(std::process::Stdio::null())
             .kill_on_drop(true)
             .output();
+        let timeout = command_timeout();
         let out = tokio::select! {
-            r = tokio::time::timeout(COMMAND_TIMEOUT, child) => match r {
+            r = tokio::time::timeout(timeout, child) => match r {
                 Ok(r) => r?,
-                Err(_) => return Ok(ToolOutcome::err(format!("Command timed out after {}s", COMMAND_TIMEOUT.as_secs()))),
+                Err(_) => return Ok(ToolOutcome::err(format!("Command timed out after {}s", timeout.as_secs()))),
             },
             () = self.cancel.cancelled() => return Ok(ToolOutcome::err("Command cancelled")),
         };

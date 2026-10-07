@@ -12,12 +12,16 @@ use std::sync::{Arc, Mutex};
 
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
-    CancelNotification, ClientCapabilities, ContentBlock, FileSystemCapabilities,
-    InitializeRequest, McpServer, McpServerHttp, McpServerStdio, NewSessionRequest,
+    CancelNotification, ClientCapabilities, ContentBlock, CreateTerminalRequest,
+    CreateTerminalResponse, FileSystemCapabilities, InitializeRequest, KillTerminalRequest,
+    KillTerminalResponse, McpServer, McpServerHttp, McpServerStdio, NewSessionRequest,
     PermissionOptionId, PromptRequest, ReadTextFileRequest, ReadTextFileResponse,
-    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
-    SelectedPermissionOutcome, SessionNotification, SessionUpdate, StopReason, TextContent,
-    ToolCallContent, ToolCallStatus, WriteTextFileRequest, WriteTextFileResponse,
+    ReleaseTerminalRequest, ReleaseTerminalResponse, RequestPermissionOutcome,
+    RequestPermissionRequest, RequestPermissionResponse, SelectedPermissionOutcome,
+    SessionNotification, SessionUpdate, StopReason, TerminalExitStatus, TerminalId,
+    TerminalOutputRequest, TerminalOutputResponse, TextContent, ToolCallContent, ToolCallStatus,
+    WaitForTerminalExitRequest, WaitForTerminalExitResponse, WriteTextFileRequest,
+    WriteTextFileResponse,
 };
 use agent_client_protocol::{AcpAgent, AcpAgentConfig, Agent, Client, ConnectionTo};
 use serde_json::{Value, json};
@@ -150,6 +154,21 @@ async fn start_mock_llm(script: Script, stats: Arc<MockStats>) -> String {
                     *stats.saw_session_header.lock().unwrap() = true;
                 }
 
+                if head.starts_with("GET /v1/models") {
+                    let body = serde_json::json!({
+                        "object": "list",
+                        "data": [{"id": "scripted-test-model", "object": "model"}]
+                    })
+                    .to_string();
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = socket.write_all(resp.as_bytes()).await;
+                    return;
+                }
+
                 assert!(
                     head.starts_with("POST /v1/chat/completions"),
                     "unexpected request: {}",
@@ -238,11 +257,66 @@ struct FsCalls {
     writes: Mutex<Vec<(PathBuf, String)>>,
 }
 
+/// Events observed on the fake terminal methods.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TerminalCallEvent {
+    Create {
+        command: String,
+        args: Vec<String>,
+        cwd: Option<PathBuf>,
+    },
+    WaitForExit {
+        terminal_id: String,
+    },
+    Kill {
+        terminal_id: String,
+    },
+    Output {
+        terminal_id: String,
+    },
+    Release {
+        terminal_id: String,
+    },
+}
+
+#[derive(Clone, Default)]
+enum TerminalPolicy {
+    #[default]
+    NotAdvertised,
+    Advertise {
+        exit_code: Option<u32>,
+        output: String,
+        hang_wait: bool,
+    },
+}
+
+#[derive(Debug, Default)]
+struct TerminalCalls {
+    events: Mutex<Vec<TerminalCallEvent>>,
+}
+
 struct Harness {
     captured: Arc<Mutex<Captured>>,
     permission_policy: PermissionPolicy,
     fs_policy: FsPolicy,
     fs_calls: Arc<FsCalls>,
+    terminal_policy: TerminalPolicy,
+    terminal_calls: Arc<TerminalCalls>,
+    command_timeout_secs: Option<u64>,
+}
+
+impl Default for Harness {
+    fn default() -> Self {
+        Self {
+            captured: Arc::default(),
+            permission_policy: PermissionPolicy::AllowAlways,
+            fs_policy: FsPolicy::NotAdvertised,
+            fs_calls: Arc::default(),
+            terminal_policy: TerminalPolicy::NotAdvertised,
+            terminal_calls: Arc::default(),
+            command_timeout_secs: None,
+        }
+    }
 }
 
 impl Harness {
@@ -264,12 +338,16 @@ impl Harness {
         cancel_midway: bool,
     ) -> (StopReason, Arc<Mutex<Captured>>) {
         let binary = env!("CARGO_BIN_EXE_onde-code");
-        let agent = AcpAgent::new(
-            AcpAgentConfig::new(binary)
-                .env("OPENAI_BASE_URL", base_url)
-                .env("OPENAI_MODEL", "scripted-test-model")
-                .env("CONDENSE_API_KEY", DEBUG_KEY),
-        );
+        let mut cfg = AcpAgentConfig::new(binary);
+        cfg = cfg
+            .env("OPENAI_BASE_URL", base_url)
+            .env("OPENAI_MODEL", "scripted-test-model")
+            .env("ONDE_CODE_MODELS", "scripted-test-model")
+            .env("CONDENSE_API_KEY", DEBUG_KEY);
+        if let Some(secs) = self.command_timeout_secs {
+            cfg = cfg.env("ONDE_CODE_COMMAND_TIMEOUT_SECS", secs.to_string());
+        }
+        let agent = AcpAgent::new(cfg);
         let captured = self.captured.clone();
         let captured_notify = captured.clone();
         let policy = self.permission_policy;
@@ -280,6 +358,16 @@ impl Harness {
         let serve_content = match &self.fs_policy {
             FsPolicy::Advertise { content } => content.clone(),
             FsPolicy::NotAdvertised => String::new(),
+        };
+        let terminal_calls = self.terminal_calls.clone();
+        let advertise_terminal = matches!(self.terminal_policy, TerminalPolicy::Advertise { .. });
+        let (term_exit_code, term_output, term_hang_wait) = match &self.terminal_policy {
+            TerminalPolicy::Advertise {
+                exit_code,
+                output,
+                hang_wait,
+            } => (*exit_code, output.clone(), *hang_wait),
+            TerminalPolicy::NotAdvertised => (None, String::new(), false),
         };
         let workdir = workdir.clone();
         let prompt = prompt.to_string();
@@ -379,17 +467,105 @@ impl Harness {
                 },
                 agent_client_protocol::on_receive_request!(),
             )
+            .on_receive_request(
+                {
+                    let terminal_calls = terminal_calls.clone();
+                    async move |req: CreateTerminalRequest, responder, _cx| {
+                        terminal_calls.events.lock().unwrap().push(TerminalCallEvent::Create {
+                            command: req.command,
+                            args: req.args,
+                            cwd: req.cwd,
+                        });
+                        responder.respond(CreateTerminalResponse::new(TerminalId::new("test-term-1")))
+                    }
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                {
+                    let terminal_calls = terminal_calls.clone();
+                    async move |req: WaitForTerminalExitRequest, responder, cx| {
+                        terminal_calls
+                            .events
+                            .lock()
+                            .unwrap()
+                            .push(TerminalCallEvent::WaitForExit {
+                                terminal_id: req.terminal_id.0.to_string(),
+                            });
+                        cx.spawn(async move {
+                            if term_hang_wait {
+                                tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+                            }
+                            responder.respond(WaitForTerminalExitResponse::new(
+                                TerminalExitStatus::new().exit_code(term_exit_code),
+                            ))
+                        })
+                    }
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                {
+                    let terminal_calls = terminal_calls.clone();
+                    async move |req: KillTerminalRequest, responder, _cx| {
+                        terminal_calls
+                            .events
+                            .lock()
+                            .unwrap()
+                            .push(TerminalCallEvent::Kill {
+                                terminal_id: req.terminal_id.0.to_string(),
+                            });
+                        responder.respond(KillTerminalResponse::new())
+                    }
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                {
+                    let terminal_calls = terminal_calls.clone();
+                    let term_output = term_output.clone();
+                    async move |req: TerminalOutputRequest, responder, _cx| {
+                        terminal_calls
+                            .events
+                            .lock()
+                            .unwrap()
+                            .push(TerminalCallEvent::Output {
+                                terminal_id: req.terminal_id.0.to_string(),
+                            });
+                        responder.respond(TerminalOutputResponse::new(term_output.clone(), false))
+                    }
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                {
+                    let terminal_calls = terminal_calls.clone();
+                    async move |req: ReleaseTerminalRequest, responder, _cx| {
+                        terminal_calls
+                            .events
+                            .lock()
+                            .unwrap()
+                            .push(TerminalCallEvent::Release {
+                                terminal_id: req.terminal_id.0.to_string(),
+                            });
+                        responder.respond(ReleaseTerminalResponse::new())
+                    }
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
             .connect_with(agent, |connection: ConnectionTo<Agent>| async move {
                 let init = connection
                     .send_request(
                         InitializeRequest::new(ProtocolVersion::V1).client_capabilities(
-                            ClientCapabilities::new().fs(if advertise_fs {
-                                FileSystemCapabilities::new()
-                                    .read_text_file(true)
-                                    .write_text_file(true)
-                            } else {
-                                FileSystemCapabilities::new()
-                            }),
+                            ClientCapabilities::new()
+                                .terminal(advertise_terminal)
+                                .fs(if advertise_fs {
+                                    FileSystemCapabilities::new()
+                                        .read_text_file(true)
+                                        .write_text_file(true)
+                                } else {
+                                    FileSystemCapabilities::new()
+                                }),
                         ),
                     )
                     .block_task()
@@ -472,6 +648,7 @@ async fn acp_full_agent_loop_with_tools() {
         permission_policy: PermissionPolicy::AllowAlways,
         fs_policy: FsPolicy::NotAdvertised,
         fs_calls: Arc::default(),
+        ..Default::default()
     };
     let (stop, captured) = harness
         .run_prompt(&base_url, &workdir, "Create hello.txt")
@@ -544,6 +721,7 @@ async fn acp_permission_rejection_blocks_write() {
         permission_policy: PermissionPolicy::RejectOnce,
         fs_policy: FsPolicy::NotAdvertised,
         fs_calls: Arc::default(),
+        ..Default::default()
     };
     let (stop, captured) = harness
         .run_prompt(&base_url, &workdir, "Create nope.txt")
@@ -581,6 +759,7 @@ async fn acp_plain_text_turn() {
         permission_policy: PermissionPolicy::AllowAlways,
         fs_policy: FsPolicy::NotAdvertised,
         fs_calls: Arc::default(),
+        ..Default::default()
     };
     let (stop, captured) = harness
         .run_prompt(&base_url, &workdir, "What is the answer?")
@@ -615,6 +794,7 @@ async fn acp_cancel_stops_turn() {
         permission_policy: PermissionPolicy::AllowAlways,
         fs_policy: FsPolicy::NotAdvertised,
         fs_calls: Arc::default(),
+        ..Default::default()
     };
     let (stop, _captured) = harness
         .run_prompt_maybe_cancel(&base_url, &workdir, "Run a long command", true)
@@ -659,6 +839,7 @@ async fn acp_fs_advertised_routes_through_client() {
             content: "live buffer content".to_string(),
         },
         fs_calls: Arc::default(),
+        ..Default::default()
     };
     let (stop, _captured) = harness
         .run_prompt(&base_url, &workdir, "Read and write files")
@@ -736,6 +917,7 @@ async fn acp_fs_read_uses_client_content_in_conversation() {
             content: "client-served line".to_string(),
         },
         fs_calls: Arc::default(),
+        ..Default::default()
     };
     let (stop, _captured) = harness.run_prompt(&base_url, &workdir, "Read a file").await;
     assert_eq!(stop, StopReason::EndTurn);
@@ -773,6 +955,7 @@ async fn acp_fs_not_advertised_falls_back_to_local() {
         permission_policy: PermissionPolicy::AllowAlways,
         fs_policy: FsPolicy::NotAdvertised,
         fs_calls: Arc::default(),
+        ..Default::default()
     };
     let (stop, _captured) = harness.run_prompt(&base_url, &workdir, "Read a file").await;
     assert_eq!(stop, StopReason::EndTurn);
@@ -811,6 +994,7 @@ async fn acp_tool_metadata_paths_are_absolute() {
         permission_policy: PermissionPolicy::AllowAlways,
         fs_policy: FsPolicy::NotAdvertised,
         fs_calls: Arc::default(),
+        ..Default::default()
     };
     let (stop, captured) = harness
         .run_prompt(&base_url, &workdir, "Write a file")
@@ -868,6 +1052,20 @@ async fn start_mock_llm_flexible(script: Script, expected_tools: usize) -> Strin
             let steps = script.0.clone();
             tokio::spawn(async move {
                 let (head, body) = read_http_request(&mut socket).await;
+                if head.starts_with("GET /v1/models") {
+                    let body = serde_json::json!({
+                        "object": "list",
+                        "data": [{"id": "scripted-test-model", "object": "model"}]
+                    })
+                    .to_string();
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = socket.write_all(resp.as_bytes()).await;
+                    return;
+                }
                 assert!(
                     head.starts_with("POST /v1/chat/completions"),
                     "unexpected request: {}",
@@ -1124,6 +1322,128 @@ async fn acp_mcp_broken_server_does_not_fail_session() {
             .text
             .contains("session still works")
     );
+
+    std::fs::remove_dir_all(&workdir).ok();
+}
+
+/// When client advertises terminal capability, run_command routes through the
+/// client's terminal methods (create → wait_for_exit → output → release).
+/// The cwd in terminal/create MUST be absolute (Issue #22 / #24).
+#[tokio::test]
+async fn acp_terminal_lifecycle_happy_path() {
+    let script = Script(vec![
+        Step::ToolCall {
+            name: "run_command",
+            arguments: json!({"command": "echo test_output"}),
+        },
+        Step::Final("command finished"),
+    ]);
+    let stats = Arc::new(MockStats::default());
+    let base_url = start_mock_llm(script, stats).await;
+    let workdir = temp_workdir();
+
+    let harness = Harness {
+        captured: Arc::default(),
+        permission_policy: PermissionPolicy::AllowAlways,
+        fs_policy: FsPolicy::NotAdvertised,
+        terminal_policy: TerminalPolicy::Advertise {
+            exit_code: Some(0),
+            output: "test_output\n".to_string(),
+            hang_wait: false,
+        },
+        ..Default::default()
+    };
+
+    let (stop, captured) = harness
+        .run_prompt(&base_url, &workdir, "Run the command")
+        .await;
+
+    assert_eq!(stop, StopReason::EndTurn);
+    let c = captured.lock().unwrap();
+    assert!(c.text.contains("command finished"));
+
+    let events = harness.terminal_calls.events.lock().unwrap().clone();
+    assert_eq!(events.len(), 4, "expected 4 terminal events: {:?}", events);
+
+    match &events[0] {
+        TerminalCallEvent::Create { command, args, cwd } => {
+            assert_eq!(command, "sh");
+            assert_eq!(args, &["-c".to_string(), "echo test_output".to_string()]);
+            let cwd = cwd.as_ref().expect("cwd must be set");
+            assert!(cwd.is_absolute(), "terminal create cwd must be absolute: {}", cwd.display());
+            assert_eq!(cwd, &workdir.canonicalize().unwrap());
+        }
+        other => panic!("expected Create event first, got {:?}", other),
+    }
+
+    match &events[1] {
+        TerminalCallEvent::WaitForExit { terminal_id } => {
+            assert_eq!(terminal_id, "test-term-1");
+        }
+        other => panic!("expected WaitForExit event second, got {:?}", other),
+    }
+
+    match &events[2] {
+        TerminalCallEvent::Output { terminal_id } => {
+            assert_eq!(terminal_id, "test-term-1");
+        }
+        other => panic!("expected Output event third, got {:?}", other),
+    }
+
+    match &events[3] {
+        TerminalCallEvent::Release { terminal_id } => {
+            assert_eq!(terminal_id, "test-term-1");
+        }
+        other => panic!("expected Release event fourth, got {:?}", other),
+    }
+
+    std::fs::remove_dir_all(&workdir).ok();
+}
+
+/// When a terminal command times out, terminal/kill MUST be invoked before
+/// terminal/output and terminal/release.
+#[tokio::test]
+async fn acp_terminal_timeout_kills_before_output() {
+    let script = Script(vec![
+        Step::ToolCall {
+            name: "run_command",
+            arguments: json!({"command": "sleep 10"}),
+        },
+        Step::Final("timed out properly"),
+    ]);
+    let stats = Arc::new(MockStats::default());
+    let base_url = start_mock_llm(script, stats).await;
+    let workdir = temp_workdir();
+
+    let harness = Harness {
+        captured: Arc::default(),
+        permission_policy: PermissionPolicy::AllowAlways,
+        fs_policy: FsPolicy::NotAdvertised,
+        terminal_policy: TerminalPolicy::Advertise {
+            exit_code: None,
+            output: "partial output before timeout\n".to_string(),
+            hang_wait: true,
+        },
+        command_timeout_secs: Some(1),
+        ..Default::default()
+    };
+
+    let (stop, captured) = harness
+        .run_prompt(&base_url, &workdir, "Run a slow command")
+        .await;
+
+    assert_eq!(stop, StopReason::EndTurn);
+    let c = captured.lock().unwrap();
+    assert!(c.text.contains("timed out properly"));
+
+    let events = harness.terminal_calls.events.lock().unwrap().clone();
+    assert_eq!(events.len(), 5, "expected 5 terminal events: {:?}", events);
+
+    assert!(matches!(&events[0], TerminalCallEvent::Create { .. }));
+    assert!(matches!(&events[1], TerminalCallEvent::WaitForExit { .. }));
+    assert!(matches!(&events[2], TerminalCallEvent::Kill { .. }), "Kill must precede Output");
+    assert!(matches!(&events[3], TerminalCallEvent::Output { .. }));
+    assert!(matches!(&events[4], TerminalCallEvent::Release { .. }));
 
     std::fs::remove_dir_all(&workdir).ok();
 }
