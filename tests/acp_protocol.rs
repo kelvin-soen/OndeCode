@@ -288,3 +288,41 @@ async fn prompt_resolves_file_links_and_reports_ids_and_usage() {
 
     std::fs::remove_dir_all(&home).ok();
 }
+
+#[tokio::test]
+async fn session_lifecycle_rejects_relative_paths() {
+    let home = temp_dir("cwd-val");
+    let bodies = Arc::new(Mutex::new(Vec::new()));
+    let base_url = start_mock_llm(bodies).await;
+    let env = llm_env(&base_url);
+    let mut agent = Agent::spawn(&home, &as_refs(&env));
+    agent.initialize(false).await;
+
+    // Relative cwd is rejected on session/new
+    let r = agent.call("session/new", json!({"cwd": "relative/path", "mcpServers": []})).await;
+    assert_eq!(r["error"]["code"], -32602, "expected invalid_params: {r}");
+    assert!(r["error"]["message"].as_str().unwrap().to_lowercase().contains("invalid"));
+
+    // Relative additional directory is rejected on session/new
+    let r = agent.call("session/new", json!({
+        "cwd": home,
+        "additionalDirectories": ["relative/root"],
+        "mcpServers": []
+    })).await;
+    assert_eq!(r["error"]["code"], -32602, "expected invalid_params: {r}");
+
+    // Valid absolute path succeeds
+    let r = agent.call("session/new", json!({"cwd": home, "mcpServers": []})).await;
+    assert!(r.get("result").is_some(), "{r}");
+    let sid = r["result"]["sessionId"].as_str().unwrap().to_string();
+
+    // Relative cwd is rejected on session/resume
+    let r = agent.call("session/resume", json!({"sessionId": sid, "cwd": "relative/path"})).await;
+    assert_eq!(r["error"]["code"], -32602, "expected invalid_params: {r}");
+
+    // Relative cwd is rejected on session/load
+    let r = agent.call("session/load", json!({"sessionId": sid, "cwd": "relative/path"})).await;
+    assert_eq!(r["error"]["code"], -32602, "expected invalid_params: {r}");
+
+    std::fs::remove_dir_all(&home).ok();
+}

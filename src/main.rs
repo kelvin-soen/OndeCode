@@ -260,7 +260,15 @@ impl CoderAgent {
         cwd: PathBuf,
         roots: Vec<PathBuf>,
         mcp_servers: Vec<McpServer>,
-    ) -> NewSessionResponse {
+    ) -> agent_client_protocol::Result<NewSessionResponse> {
+        if !cwd.is_absolute() {
+            return Err(agent_client_protocol::Error::invalid_params()
+                .data("cwd must be an absolute path"));
+        }
+        if roots.iter().any(|r| !r.is_absolute()) {
+            return Err(agent_client_protocol::Error::invalid_params()
+                .data("additionalDirectories entries must be absolute paths"));
+        }
         // ACP v1: `cwd` and additional directories must be absolute paths. Normalize
         // defensively so a sloppy client can't bind the session to a relative path.
         let cwd = tools::absolutize(&cwd);
@@ -285,7 +293,7 @@ impl CoderAgent {
             updated_at: now_secs(),
         };
         self.sessions.lock().unwrap().insert(id.clone(), session);
-        NewSessionResponse::new(id).config_options(options)
+        Ok(NewSessionResponse::new(id).config_options(options))
     }
 
     /// List live sessions, optionally filtered by working directory. Sessions are kept in
@@ -340,12 +348,29 @@ impl CoderAgent {
         connection: &ConnectionTo<Client>,
     ) -> agent_client_protocol::Result<LoadSessionResponse> {
         let session_id = req.session_id.clone();
+        if !req.cwd.is_absolute() {
+            return Err(agent_client_protocol::Error::invalid_params()
+                .data("cwd must be an absolute path"));
+        }
+        if req.additional_directories.iter().any(|r| !r.is_absolute()) {
+            return Err(agent_client_protocol::Error::invalid_params()
+                .data("additionalDirectories entries must be absolute paths"));
+        }
         let (model, messages) = {
-            let sessions = self.sessions.lock().unwrap();
-            let s = sessions.get(&session_id).ok_or_else(|| {
+            let mut sessions = self.sessions.lock().unwrap();
+            let s = sessions.get_mut(&session_id).ok_or_else(|| {
                 agent_client_protocol::Error::invalid_params()
                     .data(format!("unknown session {session_id}"))
             })?;
+            s.cwd = tools::absolutize(&req.cwd);
+            if !req.additional_directories.is_empty() {
+                s.roots = req
+                    .additional_directories
+                    .into_iter()
+                    .map(|r| tools::absolutize(&r))
+                    .collect();
+            }
+            s.updated_at = now_secs();
             (s.model.clone(), s.messages.clone())
         };
         let notify = |update: SessionUpdate| {
@@ -417,6 +442,14 @@ impl CoderAgent {
         req: ResumeSessionRequest,
     ) -> agent_client_protocol::Result<ResumeSessionResponse> {
         let session_id = req.session_id.clone();
+        if !req.cwd.is_absolute() {
+            return Err(agent_client_protocol::Error::invalid_params()
+                .data("cwd must be an absolute path"));
+        }
+        if req.additional_directories.iter().any(|r| !r.is_absolute()) {
+            return Err(agent_client_protocol::Error::invalid_params()
+                .data("additionalDirectories entries must be absolute paths"));
+        }
         let model = {
             let mut sessions = self.sessions.lock().unwrap();
             let s = sessions.get_mut(&session_id).ok_or_else(|| {
@@ -1050,11 +1083,13 @@ async fn run_agent(yolo_flag: bool) -> agent_client_protocol::Result<()> {
                         if !agent.llm().has_api_key() {
                             return responder.respond_with_error(auth_required_error());
                         }
-                        responder.respond(
-                            agent
-                                .new_session(req.cwd, req.additional_directories, req.mcp_servers)
-                                .await,
-                        )
+                        match agent
+                            .new_session(req.cwd, req.additional_directories, req.mcp_servers)
+                            .await
+                        {
+                            Ok(resp) => responder.respond(resp),
+                            Err(e) => responder.respond_with_error(e),
+                        }
                     })
                 }
             },

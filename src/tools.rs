@@ -150,7 +150,17 @@ pub fn describe(
         .map(|p| absolutize(&p));
     let loc = path
         .clone()
-        .map(ToolCallLocation::new)
+        .map(|p| {
+            let mut location = ToolCallLocation::new(p);
+            if name == "read_file" {
+                if let Some(line) = args.get("line").and_then(Value::as_u64) {
+                    if line >= 1 {
+                        location = location.line(line as u32);
+                    }
+                }
+            }
+            location
+        })
         .into_iter()
         .collect();
     let shown = path
