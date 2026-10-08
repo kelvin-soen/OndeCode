@@ -707,8 +707,7 @@ async fn acp_full_agent_loop_with_tools() {
     // ToolCall.name carries the programmatic tool name next to the human title.
     assert_eq!(
         c.tool_names,
-        ["list_directory", "write_file", "read_file", "run_command"]
-            .map(|n| Some(n.to_string()))
+        ["list_directory", "write_file", "read_file", "run_command"].map(|n| Some(n.to_string()))
     );
     // 4 tool calls started; the 2 writes asked for permission (reads/list don't).
     assert_eq!(
