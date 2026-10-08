@@ -91,7 +91,17 @@ async fn onde_answers_prompt() {
         )
         .connect_with(
             // ONDE_CODE_PROVIDER=onde takes precedence over any inherited provider env vars.
-            AcpAgent::new(AcpAgentConfig::new(BIN).env("ONDE_CODE_PROVIDER", "onde")),
+            AcpAgent::new(
+                AcpAgentConfig::new(BIN)
+                    .env("ONDE_CODE_PROVIDER", "onde")
+                    .env(
+                        "ONDE_CODE_SESSIONS_DIR",
+                        std::env::temp_dir()
+                            .join("onde-code-test-sessions")
+                            .to_string_lossy()
+                            .into_owned(),
+                    ),
+            ),
             |connection: ConnectionTo<Agent>| async move {
                 connection
                     .send_request(InitializeRequest::new(ProtocolVersion::V1))

@@ -347,6 +347,7 @@ impl Harness {
         let binary = env!("CARGO_BIN_EXE_onde-code");
         let mut cfg = AcpAgentConfig::new(binary);
         cfg = cfg
+            .env("ONDE_CODE_SESSIONS_DIR", test_sessions_dir())
             .env("OPENAI_BASE_URL", base_url)
             .env("OPENAI_MODEL", "scripted-test-model")
             .env("ONDE_CODE_MODELS", "scripted-test-model")
@@ -643,6 +644,12 @@ impl Harness {
 
         (stop_reason, self.captured.clone())
     }
+}
+
+/// Where test agents store sessions, so tests never write to the developer's data dir.
+fn test_sessions_dir() -> String {
+    let dir = std::env::temp_dir().join("onde-code-test-sessions");
+    dir.to_string_lossy().into_owned()
 }
 
 fn temp_workdir() -> PathBuf {
@@ -1176,6 +1183,7 @@ async fn acp_mcp_stdio_tool_is_forwarded() {
     let binary = env!("CARGO_BIN_EXE_onde-code");
     let agent = AcpAgent::new(
         AcpAgentConfig::new(binary)
+            .env("ONDE_CODE_SESSIONS_DIR", test_sessions_dir())
             .env("OPENAI_BASE_URL", &base_url)
             .env("OPENAI_MODEL", "scripted-test-model")
             .env("OPENAI_API_KEY", TEST_KEY)
@@ -1301,6 +1309,7 @@ async fn acp_mcp_broken_server_does_not_fail_session() {
     let binary = env!("CARGO_BIN_EXE_onde-code");
     let agent = AcpAgent::new(
         AcpAgentConfig::new(binary)
+            .env("ONDE_CODE_SESSIONS_DIR", test_sessions_dir())
             .env("OPENAI_BASE_URL", &base_url)
             .env("OPENAI_MODEL", "scripted-test-model")
             .env("OPENAI_API_KEY", TEST_KEY)

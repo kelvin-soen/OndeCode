@@ -52,7 +52,7 @@ impl Provider {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LlmConfig {
     pub provider: Provider,
     pub base_url: String,
@@ -394,6 +394,10 @@ impl LlmClient {
 
     pub fn model(&self) -> &str {
         &self.config.model
+    }
+
+    pub fn config(&self) -> &LlmConfig {
+        &self.config
     }
 
     /// Whether an API key is configured for the selected provider.
