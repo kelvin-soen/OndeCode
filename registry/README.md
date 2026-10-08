@@ -1,47 +1,47 @@
-# ACP Registry submission
+# ACP registry entry
 
-Everything needed to list onde-code in the [ACP registry](https://agentclientprotocol.com/get-started/registry)
-([agentclientprotocol/registry](https://github.com/agentclientprotocol/registry)).
+`agent.json` is onde-code's entry in the [ACP registry](https://agentclientprotocol.com/get-started/registry)
+([agentclientprotocol/registry](https://github.com/agentclientprotocol/registry)). It mirrors
+`onde-code/agent.json` in the registry, where the icon sits next to it as `onde-code/icon.svg`
+(a copy of `assets/icon.svg`). The first submission is
+[agentclientprotocol/registry#652](https://github.com/agentclientprotocol/registry/pull/652).
 
-## Prerequisites (done in this repo)
+What the registry checks, and where this repo covers it:
 
-- [x] `initialize` advertises a `terminal` auth method (`terminal-setup`) — registry CI requires
-      agent or terminal auth.
-- [x] `session/new` / `session/prompt` return `AUTH_REQUIRED` when no API key is configured.
-- [x] Release workflow (`.github/workflows/release.yml`) builds binaries for all five registry
-      platforms on `v*` tags and attaches archives + checksums to the GitHub release.
-- [x] 16×16 monochrome `currentColor` icon at `assets/icon.svg`.
+- `initialize` returns a `terminal` auth method (`terminal-setup`, runs `onde-code --setup`). The
+  registry's CI starts the binary with an empty `HOME`, so that method is what it sees.
+- `session/new` and `session/prompt` return `AUTH_REQUIRED` until a key is configured.
+- `.github/workflows/release.yml` builds the five registry platforms on a `v*` tag and attaches
+  the archives and `checksums.txt` to the release. It refuses a tag that doesn't match the
+  version in `Cargo.toml`.
+- `assets/icon.svg` is a 16×16 monochrome icon drawn with `currentColor`.
 
-## Submitting
+## Updating the entry for a release
 
-1. Merge the stack (PRs #1, #2, #4) to `main`.
-2. Tag and push the first release:
-
-   ```sh
-   git tag v0.1.0 origin/main && git push origin v0.1.0
-   ```
-
-   Wait for the `release` workflow to finish — it creates the release with archives and
-   `checksums.txt`.
-3. Fill in the five `sha256` placeholders in `agent.json` from the release's `checksums.txt`
-   (or drop the fields; they are recommended, not required).
-4. Fork [agentclientprotocol/registry](https://github.com/agentclientprotocol/registry), then:
+1. Bump `version` in `Cargo.toml` on `main`, then tag that commit and push the tag:
 
    ```sh
-   mkdir onde-code
-   cp agent.json onde-code/agent.json
-   cp ../assets/icon.svg onde-code/icon.svg   # icon must sit next to agent.json
+   git tag v1.0.0 origin/main && git push origin v1.0.0
    ```
 
-5. Validate locally from the registry checkout:
+2. Wait for the `release` workflow to publish the release, then point `agent.json` at it:
 
    ```sh
-   SKIP_URL_VALIDATION=1 uv run --with jsonschema .github/workflows/build_registry.py
+   registry/update-agent.sh v1.0.0
    ```
 
-   (Drop `SKIP_URL_VALIDATION=1` once the v0.1.0 release exists — the archive URLs are checked
-   for HTTP 200.)
+   It downloads the five archives, hashes them, and writes the version, URLs and `sha256`
+   values. Commit the result here.
 
-6. Open the PR. Registry CI will re-validate the schema, the icon rules, and probe the binary
-   for a valid `authMethods` response (runs the agent with an empty sandbox `HOME`, so the
-   terminal auth method is what it sees).
+3. In a registry fork, copy the files and validate:
+
+   ```sh
+   cp ../OndeCode/registry/agent.json onde-code/agent.json
+   cp ../OndeCode/assets/icon.svg onde-code/icon.svg
+   uv run --with jsonschema .github/workflows/build_registry.py
+   ```
+
+   The script checks that every archive URL answers with HTTP 200, so run it after the release
+   is published.
+
+4. Push to the fork. While #652 is open, that updates it; after it merges, open a new PR.
