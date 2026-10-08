@@ -68,7 +68,9 @@ Zed, add it to `settings.json`:
 ```
 
 If no key is configured, the agent offers a terminal auth method that runs `onde-code --setup`,
-and answers `session/new` and `session/prompt` with `AUTH_REQUIRED` until a key exists. Logging
+and answers `session/new`, `session/load`, `session/resume` and `session/prompt` with
+`AUTH_REQUIRED` until a key exists. Once `--setup` succeeds, the editor retries and the running
+agent picks up the stored key, so the open thread comes back without restarting anything. Logging
 out from the editor deletes the stored key.
 
 In the editor you get:
@@ -77,7 +79,8 @@ In the editor you get:
 - an "Auto-approve actions" toggle, in editors that support boolean config options
 - `/models` and `/setup` slash commands, answered locally without a model call
 - a thread history: sessions can be listed, resumed, loaded (with full replay), closed and
-  deleted. Sessions live in memory, so the history covers the current agent process only.
+  deleted. Sessions are saved to disk, so threads reopen with their history after the editor
+  or the agent restarts. Permission choices ("always allow", auto-approve) are not saved.
 
 ## Use it in the terminal
 
@@ -153,6 +156,7 @@ onde-code --list-models     # what the configured endpoint serves
 | `ONDE_CODE_MODELS` | listed from `/models` | comma-separated models for the editor's model picker |
 | `ONDE_CODE_YOLO` | unset | `1` or `true` approves every tool call |
 | `ONDE_CODE_COMMAND_TIMEOUT_SECS` | `120` | how long `run_command` may run before it is killed |
+| `ONDE_CODE_SESSIONS_DIR` | `ondecode/sessions` in the local data dir | where sessions are saved (`~/Library/Application Support` on macOS, `~/.local/share` on Linux, `%LOCALAPPDATA%` on Windows) |
 | `ONDE_CODE_CONTEXT_WINDOW` | `128000` | context size reported in `usage_update` |
 | `ONDE_CODE_SURFACE` | `acp` | set to `tui` by the terminal UI |
 | `RUST_LOG` | unset | log filter; logs go to stderr, never stdout |
@@ -177,6 +181,7 @@ need no API key or network. `tests/acp_integration.rs` drives the agent with the
 | `src/main.rs` | ACP handlers, sessions, config options, slash commands, the agent loop |
 | `src/llm.rs` | provider config and the streaming chat completions client |
 | `src/tools.rs` | tool schemas and execution, permissions, client `fs/*` and `terminal/*` routing |
+| `src/store.rs` | sessions on disk, so threads survive a restart |
 | `src/mcp.rs` | stdio MCP client: handshake, tool listing, `tools/call` |
 | `src/tui.rs` | the ratatui terminal UI, an ACP client that runs the agent as a subprocess |
 | `registry/` | the first ACP registry submission; later releases are picked up by the registry |

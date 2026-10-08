@@ -114,6 +114,7 @@ impl Agent {
         cmd.arg("--acp")
             .env("HOME", home)
             .env("XDG_CONFIG_HOME", home.join(".config"))
+            .env("ONDE_CODE_SESSIONS_DIR", home.join("sessions"))
             .env_remove("ONDE_API_KEY")
             .env_remove("OPENAI_API_KEY")
             .env_remove("OPENAI_BASE_URL")
@@ -588,6 +589,165 @@ async fn slash_commands_are_advertised_and_answered_locally() {
         .map(|c| c["name"].as_str().unwrap())
         .collect();
     assert_eq!(names, ["models", "setup"]);
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[tokio::test]
+async fn sessions_survive_an_agent_restart() {
+    // Editors reopen their last thread on launch, with a session id from an earlier process.
+    let home = temp_dir("restart");
+    let bodies = Arc::new(Mutex::new(Vec::new()));
+    let base_url = start_mock_llm(bodies.clone()).await;
+    let env = llm_env(&base_url);
+
+    let mut first = Agent::spawn(&home, &as_refs(&env));
+    first.initialize(false).await;
+    let r = first
+        .call("session/new", json!({"cwd": home, "mcpServers": []}))
+        .await;
+    let sid = r["result"]["sessionId"].as_str().unwrap().to_string();
+    let r = first
+        .call(
+            "session/prompt",
+            json!({"sessionId": sid, "prompt": [{"type":"text","text":"remember-me-4471"}]}),
+        )
+        .await;
+    assert_eq!(r["result"]["stopReason"], "end_turn", "{r}");
+    drop(first);
+
+    let mut second = Agent::spawn(&home, &as_refs(&env));
+    second.initialize(false).await;
+
+    let r = second.call("session/list", json!({"cwd": home})).await;
+    let sessions = r["result"]["sessions"].as_array().unwrap();
+    assert_eq!(sessions.len(), 1, "{r}");
+    assert_eq!(sessions[0]["sessionId"], sid);
+    assert_eq!(sessions[0]["title"], "remember-me-4471");
+
+    let r = second
+        .call(
+            "session/resume",
+            json!({"sessionId": sid, "cwd": home, "mcpServers": []}),
+        )
+        .await;
+    assert!(r.get("error").is_none(), "{r}");
+
+    let r = second
+        .call(
+            "session/load",
+            json!({"sessionId": sid, "cwd": home, "mcpServers": []}),
+        )
+        .await;
+    assert!(r.get("error").is_none(), "{r}");
+    let replayed: Vec<&Value> = second
+        .updates
+        .iter()
+        .map(|u| &u["update"])
+        .filter(|u| u["sessionUpdate"] == "user_message_chunk")
+        .collect();
+    assert_eq!(replayed.len(), 1, "{:?}", second.updates);
+    assert_eq!(replayed[0]["content"]["text"], "remember-me-4471");
+
+    // The next turn sends the earlier conversation to the model.
+    let r = second
+        .call(
+            "session/prompt",
+            json!({"sessionId": sid, "prompt": [{"type":"text","text":"and now?"}]}),
+        )
+        .await;
+    assert_eq!(r["result"]["stopReason"], "end_turn", "{r}");
+    let sent = bodies.lock().unwrap().last().unwrap().to_string();
+    assert!(
+        sent.contains("remember-me-4471"),
+        "history not restored: {sent}"
+    );
+
+    // Ids become file names, so anything but a plain id is just an unknown session.
+    let r = second
+        .call(
+            "session/resume",
+            json!({"sessionId": "../escape", "cwd": home, "mcpServers": []}),
+        )
+        .await;
+    assert_eq!(r["error"]["code"], -32602, "{r}");
+
+    let r = second
+        .call("session/delete", json!({"sessionId": sid}))
+        .await;
+    assert!(r.get("error").is_none(), "{r}");
+    drop(second);
+
+    let mut third = Agent::spawn(&home, &as_refs(&env));
+    third.initialize(false).await;
+    let r = third.call("session/list", json!({})).await;
+    assert_eq!(
+        r["result"]["sessions"],
+        json!([]),
+        "deleted sessions stay deleted"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[tokio::test]
+async fn terminal_auth_then_reopen_without_authenticate() {
+    // Zed's terminal auth runs `onde-code --setup` in its own process, then retries
+    // session/new or session/load on the running agent without calling `authenticate`.
+    let home = temp_dir("terminal-auth");
+    let bodies = Arc::new(Mutex::new(Vec::new()));
+    let base_url = start_mock_llm(bodies).await;
+    let mut agent = Agent::spawn(
+        &home,
+        &[
+            ("OPENAI_BASE_URL", &base_url),
+            ("ONDE_CODE_MODELS", "mock-model"),
+        ],
+    );
+    agent.initialize(true).await;
+
+    let r = agent
+        .call("session/new", json!({"cwd": home, "mcpServers": []}))
+        .await;
+    assert_eq!(r["error"]["code"], -32000, "expected auth_required: {r}");
+    // A thread the editor kept from an earlier run asks for sign-in too, not "unknown session".
+    let thread = json!({"sessionId": "thread-from-before", "cwd": home, "mcpServers": []});
+    let r = agent.call("session/load", thread.clone()).await;
+    assert_eq!(r["error"]["code"], -32000, "expected auth_required: {r}");
+
+    // What `--setup` writes.
+    let cfg = home.join(".config/ondecode");
+    std::fs::create_dir_all(&cfg).unwrap();
+    std::fs::write(
+        cfg.join("env"),
+        "ONDE_CODE_PROVIDER=openai\nOPENAI_API_KEY=k\nOPENAI_MODEL=mock-model\n",
+    )
+    .unwrap();
+
+    // The thread reopens: its history lived in a process that never saved it, so it starts
+    // empty under the same id and says so.
+    let r = agent.call("session/load", thread).await;
+    assert!(r.get("error").is_none(), "{r}");
+    let notice = agent
+        .updates
+        .iter()
+        .find(|u| u["sessionId"] == "thread-from-before")
+        .expect("history notice");
+    let text = notice["update"]["content"]["text"].as_str().unwrap();
+    assert!(text.contains("starts fresh"), "{notice}");
+
+    let r = agent
+        .call(
+            "session/prompt",
+            json!({"sessionId": "thread-from-before", "prompt": [{"type":"text","text":"hi"}]}),
+        )
+        .await;
+    assert_eq!(r["result"]["stopReason"], "end_turn", "{r}");
+
+    let r = agent
+        .call("session/new", json!({"cwd": home, "mcpServers": []}))
+        .await;
+    assert!(r["result"]["sessionId"].is_string(), "{r}");
 
     std::fs::remove_dir_all(&home).ok();
 }

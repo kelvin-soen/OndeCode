@@ -7,6 +7,7 @@
 
 mod llm;
 mod mcp;
+mod store;
 mod tools;
 mod tui;
 
@@ -87,6 +88,44 @@ struct Session {
     updated_at: u64,
 }
 
+impl Session {
+    /// A session restored from the store. Permission grants and the auto-approve toggle
+    /// start fresh; MCP servers are connected by the load/resume request that restores it.
+    fn restored(meta: store::SessionMeta, messages: Vec<Value>, auto_approve: bool) -> Self {
+        Self {
+            cwd: meta.cwd,
+            roots: meta.roots,
+            model: meta.model,
+            messages,
+            cancel: CancellationToken::new(),
+            always_allowed: Arc::default(),
+            auto_approve: Arc::new(AtomicBool::new(auto_approve)),
+            mcp: Arc::default(),
+            always_rejected: Arc::default(),
+            title: meta.title,
+            updated_at: meta.updated_at,
+        }
+    }
+
+    fn meta(&self, id: &SessionId) -> store::SessionMeta {
+        store::SessionMeta {
+            id: id.0.to_string(),
+            cwd: self.cwd.clone(),
+            roots: self.roots.clone(),
+            model: self.model.clone(),
+            title: self.title.clone(),
+            updated_at: self.updated_at,
+        }
+    }
+
+    fn info(&self, id: &SessionId) -> SessionInfo {
+        SessionInfo::new(id.clone(), self.cwd.clone())
+            .additional_directories(self.roots.clone())
+            .title(self.title.clone())
+            .updated_at(iso8601(self.updated_at))
+    }
+}
+
 /// Seconds since the Unix epoch, for `SessionInfo::updated_at`.
 fn now_secs() -> u64 {
     SystemTime::now()
@@ -130,6 +169,8 @@ struct CoderAgent {
     /// Models offered for selection, fetched from `GET /models` on first use.
     /// Cached model list; cleared when credentials change.
     models: Arc<tokio::sync::Mutex<Option<Vec<String>>>>,
+    /// Sessions on disk, so editors can reopen threads from an earlier process.
+    store: Arc<store::SessionStore>,
 }
 
 impl CoderAgent {
@@ -217,6 +258,23 @@ impl CoderAgent {
         *self.models.lock().await = None;
     }
 
+    /// Re-read credentials and report whether a key is configured. Editors run terminal
+    /// auth (`onde-code --setup`) in a separate process and then retry `session/new` or
+    /// `session/load` on this one without calling `authenticate`, so the stored key has to be
+    /// picked up here. The model list is only dropped when the configuration changed.
+    async fn refresh_credentials(&self) -> bool {
+        let fresh = LlmConfig::from_env();
+        if fresh != *self.llm().config() {
+            tracing::info!(
+                "credentials changed; reloading provider {}",
+                fresh.provider.name()
+            );
+            *self.llm.write().unwrap() = LlmClient::new(fresh);
+            *self.models.lock().await = None;
+        }
+        self.llm().has_api_key()
+    }
+
     /// Whether the client advertised `session.configOptions.boolean`, which ACP requires
     /// before an agent may offer `type: "boolean"` options.
     fn boolean_options_supported(&self) -> bool {
@@ -258,6 +316,47 @@ impl CoderAgent {
         config
     }
 
+    /// Bring a session from an earlier process back into memory. Returns whether the session
+    /// is now in memory (it may already have been).
+    fn restore(&self, id: &SessionId) -> bool {
+        if self.sessions.lock().unwrap().contains_key(id) {
+            return true;
+        }
+        let Some((meta, messages)) = self.store.load(&id.0) else {
+            return false;
+        };
+        tracing::info!("restored session {id} from disk");
+        self.sessions
+            .lock()
+            .unwrap()
+            .entry(id.clone())
+            .or_insert_with(|| Session::restored(meta, messages, self.yolo));
+        true
+    }
+
+    /// Save a session's metadata. Safe mid-turn, unlike [`Self::persist_history`].
+    fn persist_meta(&self, id: &SessionId) {
+        let meta = self.sessions.lock().unwrap().get(id).map(|s| s.meta(id));
+        if let Some(meta) = meta {
+            self.store.save_meta(&meta);
+        }
+    }
+
+    /// Save a session's metadata and history. Only call this while no turn is running:
+    /// a turn takes the history out of the session until it ends.
+    fn persist_history(&self, id: &SessionId) {
+        let saved = self
+            .sessions
+            .lock()
+            .unwrap()
+            .get(id)
+            .map(|s| (s.meta(id), s.messages.clone()));
+        if let Some((meta, messages)) = saved {
+            self.store.save_history(&meta.id, &messages);
+            self.store.save_meta(&meta);
+        }
+    }
+
     /// The model and auto-approve setting of a session, for building its config options.
     fn session_settings(&self, session_id: &SessionId) -> Option<(String, bool)> {
         self.sessions
@@ -274,6 +373,7 @@ impl CoderAgent {
     ) -> agent_client_protocol::Result<SetSessionConfigOptionResponse> {
         let invalid = |msg: String| agent_client_protocol::Error::invalid_params().data(msg);
         let unknown_session = || invalid(format!("unknown session {}", req.session_id));
+        self.restore(&req.session_id);
         match &*req.config_id.0 {
             MODEL_CONFIG_ID => {
                 let Some(model) = req.value.as_value_id().map(|v| v.0.to_string()) else {
@@ -286,6 +386,7 @@ impl CoderAgent {
                     Some(s) => s.model = model.clone(),
                     None => return Err(unknown_session()),
                 }
+                self.persist_meta(&req.session_id);
                 tracing::info!("session {} now uses model {model}", req.session_id);
             }
             AUTO_APPROVE_CONFIG_ID if self.boolean_options_supported() => {
@@ -398,29 +499,82 @@ impl CoderAgent {
         let id = SessionId::new(uuid::Uuid::new_v4().to_string());
         let model = self.llm().model().to_string();
         let options = self.config_options(&model, self.yolo).await;
+        self.open_fresh_session(&id, cwd, roots);
         // ACP v1: connect to all stdio MCP servers the client specifies.
         let mcp_registry = mcp::McpRegistry::connect_all(&mcp_servers).await;
+        if let Some(s) = self.sessions.lock().unwrap().get_mut(&id) {
+            s.mcp = Arc::new(tokio::sync::Mutex::new(mcp_registry));
+        }
+        Ok(NewSessionResponse::new(id).config_options(options))
+    }
+
+    /// Start an empty session under `id` and save it.
+    fn open_fresh_session(&self, id: &SessionId, cwd: PathBuf, roots: Vec<PathBuf>) {
         let session = Session {
             messages: vec![
                 json!({ "role": "system", "content": self.system_prompt(&cwd, &roots) }),
             ],
-            model,
+            model: self.llm().model().to_string(),
             cwd,
             roots,
             cancel: CancellationToken::new(),
             always_allowed: Arc::default(),
             auto_approve: Arc::new(AtomicBool::new(self.yolo)),
-            mcp: Arc::new(tokio::sync::Mutex::new(mcp_registry)),
+            mcp: Arc::default(),
             always_rejected: Arc::default(),
             title: None,
             updated_at: now_secs(),
         };
         self.sessions.lock().unwrap().insert(id.clone(), session);
-        Ok(NewSessionResponse::new(id).config_options(options))
+        self.persist_history(id);
     }
 
-    /// List live sessions, optionally filtered by working directory. Sessions are kept in
-    /// memory only, so only sessions created by this process show up, most recent first.
+    /// Make sure `id` is in memory for load/resume: from memory, from disk, or, for a thread
+    /// whose history is gone (it lived in a process that never saved it), as a fresh session
+    /// under the same id so the editor's thread opens instead of failing to launch. Returns
+    /// whether the history was lost; errors only for ids that can't name a session.
+    fn reopen(
+        &self,
+        id: &SessionId,
+        cwd: &std::path::Path,
+        roots: &[PathBuf],
+    ) -> agent_client_protocol::Result<bool> {
+        if self.restore(id) {
+            return Ok(false);
+        }
+        if !store::is_valid_id(&id.0) {
+            return Err(agent_client_protocol::Error::invalid_params()
+                .data(format!("unknown session {id}")));
+        }
+        tracing::warn!("session {id} has no saved history; reopening it empty");
+        let roots = roots.iter().map(|r| tools::absolutize(r)).collect();
+        self.open_fresh_session(id, tools::absolutize(cwd), roots);
+        Ok(true)
+    }
+
+    /// Tell the user a reopened thread starts without its earlier history. Shown in the
+    /// thread only; the model doesn't see it.
+    fn notify_history_lost(
+        &self,
+        connection: &ConnectionTo<Client>,
+        id: &SessionId,
+    ) -> agent_client_protocol::Result<()> {
+        connection.send_notification(SessionNotification::new(
+            id.clone(),
+            SessionUpdate::AgentMessageChunk(
+                ContentChunk::new(
+                    "Onde Code no longer has this conversation's history, so it starts fresh \
+                     from here."
+                        .to_string()
+                        .into(),
+                )
+                .message_id(MessageId::new(uuid::Uuid::new_v4().to_string())),
+            ),
+        ))
+    }
+
+    /// List sessions, in memory and on disk, optionally filtered by working directory, most
+    /// recent first.
     fn list_sessions(
         &self,
         req: ListSessionsRequest,
@@ -430,18 +584,28 @@ impl CoderAgent {
             return Err(agent_client_protocol::Error::invalid_params()
                 .data(format!("invalid cursor {cursor}")));
         }
+        // Session cwds are stored normalized, so normalize the filter the same way.
+        let want_cwd = req.cwd.as_ref().map(|c| tools::absolutize(c));
+        let stored = self.store.list();
         let sessions = self.sessions.lock().unwrap();
-        // Sort on the raw epoch seconds; the ISO 8601 string is only for display.
-        let mut entries: Vec<(u64, SessionInfo)> = sessions
+        // Memory is newer than disk for a live session, so it wins.
+        let on_disk = stored
+            .into_iter()
+            .map(|m| (SessionId::new(m.id.clone()), m))
+            .filter(|(id, _)| !sessions.contains_key(id))
+            .map(|(id, m)| {
+                let s = Session::restored(m, Vec::new(), false);
+                let info = s.info(&id);
+                (s.cwd, s.updated_at, info)
+            });
+        let live = sessions
             .iter()
-            .filter(|(_, s)| req.cwd.as_ref().is_none_or(|cwd| *cwd == s.cwd))
-            .map(|(id, s)| {
-                let info = SessionInfo::new(id.clone(), s.cwd.clone())
-                    .additional_directories(s.roots.clone())
-                    .title(s.title.clone())
-                    .updated_at(iso8601(s.updated_at));
-                (s.updated_at, info)
-            })
+            .map(|(id, s)| (s.cwd.clone(), s.updated_at, s.info(id)));
+        // Sort on the raw epoch seconds; the ISO 8601 string is only for display.
+        let mut entries: Vec<(u64, SessionInfo)> = live
+            .chain(on_disk)
+            .filter(|(cwd, _, _)| want_cwd.as_ref().is_none_or(|want| want == cwd))
+            .map(|(_, updated, info)| (updated, info))
             .collect();
         entries.sort_by_key(|(updated, _)| std::cmp::Reverse(*updated));
         Ok(ListSessionsResponse::new(
@@ -449,11 +613,13 @@ impl CoderAgent {
         ))
     }
 
-    /// Forget a session. Idempotent: deleting an unknown session succeeds.
+    /// Forget a session, in memory and on disk. Idempotent: deleting an unknown session
+    /// succeeds.
     fn delete_session(&self, req: DeleteSessionRequest) -> DeleteSessionResponse {
         if let Some(s) = self.sessions.lock().unwrap().remove(&req.session_id) {
             s.cancel.cancel();
         }
+        self.store.delete(&req.session_id.0);
         DeleteSessionResponse::new()
     }
 
@@ -480,6 +646,7 @@ impl CoderAgent {
             return Err(agent_client_protocol::Error::invalid_params()
                 .data("additionalDirectories entries must be absolute paths"));
         }
+        let history_lost = self.reopen(&session_id, &req.cwd, &req.additional_directories)?;
         let (model, auto_approve, messages) = {
             let mut sessions = self.sessions.lock().unwrap();
             let s = sessions.get_mut(&session_id).ok_or_else(|| {
@@ -501,6 +668,7 @@ impl CoderAgent {
                 s.messages.clone(),
             )
         };
+        self.persist_meta(&session_id);
         let notify = |update: SessionUpdate| {
             connection.send_notification(SessionNotification::new(session_id.clone(), update))
         };
@@ -552,6 +720,9 @@ impl CoderAgent {
                 _ => {}
             }
         }
+        if history_lost {
+            self.notify_history_lost(connection, &session_id)?;
+        }
         let options = self.config_options(&model, auto_approve).await;
         // ACP v1: connect to MCP servers specified in the load request.
         if !req.mcp_servers.is_empty() {
@@ -568,6 +739,7 @@ impl CoderAgent {
     async fn resume_session(
         &self,
         req: ResumeSessionRequest,
+        connection: &ConnectionTo<Client>,
     ) -> agent_client_protocol::Result<ResumeSessionResponse> {
         let session_id = req.session_id.clone();
         if !req.cwd.is_absolute() {
@@ -578,6 +750,10 @@ impl CoderAgent {
         if req.additional_directories.iter().any(|r| !r.is_absolute()) {
             return Err(agent_client_protocol::Error::invalid_params()
                 .data("additionalDirectories entries must be absolute paths"));
+        }
+        let history_lost = self.reopen(&session_id, &req.cwd, &req.additional_directories)?;
+        if history_lost {
+            self.notify_history_lost(connection, &session_id)?;
         }
         let (model, auto_approve) = {
             let mut sessions = self.sessions.lock().unwrap();
@@ -596,6 +772,7 @@ impl CoderAgent {
             s.updated_at = now_secs();
             (s.model.clone(), s.auto_approve.load(Ordering::Relaxed))
         };
+        self.persist_meta(&session_id);
         // ACP v1: connect to MCP servers specified in the resume request.
         if !req.mcp_servers.is_empty() {
             let registry = mcp::McpRegistry::connect_all(&req.mcp_servers).await;
@@ -614,7 +791,8 @@ impl CoderAgent {
     ) -> agent_client_protocol::Result<CloseSessionResponse> {
         let session_id = req.session_id.clone();
         let removed = self.sessions.lock().unwrap().remove(&session_id);
-        if removed.is_none() {
+        // A session from an earlier process that was never reopened has nothing to close.
+        if removed.is_none() && self.store.load(&session_id.0).is_none() {
             return Err(agent_client_protocol::Error::invalid_params()
                 .data(format!("unknown session {session_id}")));
         }
@@ -631,6 +809,8 @@ impl CoderAgent {
         responder: Responder<PromptResponse>,
         connection: ConnectionTo<Client>,
     ) -> agent_client_protocol::Result<()> {
+        // A client may prompt a reopened thread without loading or resuming it first.
+        self.restore(&request.session_id);
         match self.run_command(&request, &connection).await {
             Ok(Some(stop)) => return responder.respond(PromptResponse::new(stop)),
             Ok(None) => {}
@@ -706,6 +886,7 @@ impl CoderAgent {
             s.messages = messages;
             s.updated_at = now_secs();
         }
+        self.persist_history(&session_id);
         result
     }
 
@@ -1192,6 +1373,7 @@ async fn run_agent(yolo_flag: bool) -> agent_client_protocol::Result<()> {
         client_caps: Arc::default(),
         sessions: Arc::default(),
         models: Arc::default(),
+        store: Arc::new(store::SessionStore::from_env()),
     };
     tracing::info!("onde-code starting with model {}", agent.llm().model());
 
@@ -1252,7 +1434,7 @@ async fn run_agent(yolo_flag: bool) -> agent_client_protocol::Result<()> {
                     let agent = agent.clone();
                     let connection = cx.clone();
                     cx.spawn(async move {
-                        if !agent.llm().has_api_key() {
+                        if !agent.refresh_credentials().await {
                             return responder.respond_with_error(auth_required_error());
                         }
                         match agent
@@ -1289,6 +1471,11 @@ async fn run_agent(yolo_flag: bool) -> agent_client_protocol::Result<()> {
                     let agent = agent.clone();
                     let connection = cx.clone();
                     cx.spawn(async move {
+                        // Editors reopen a thread with session/load after terminal auth, so
+                        // answering AUTH_REQUIRED here shows sign-in instead of a dead thread.
+                        if !agent.refresh_credentials().await {
+                            return responder.respond_with_error(auth_required_error());
+                        }
                         let id = req.session_id.clone();
                         match agent.load_session(req, &connection).await {
                             Ok(resp) => {
@@ -1309,8 +1496,11 @@ async fn run_agent(yolo_flag: bool) -> agent_client_protocol::Result<()> {
                     let agent = agent.clone();
                     let connection = cx.clone();
                     cx.spawn(async move {
+                        if !agent.refresh_credentials().await {
+                            return responder.respond_with_error(auth_required_error());
+                        }
                         let id = req.session_id.clone();
-                        match agent.resume_session(req).await {
+                        match agent.resume_session(req, &connection).await {
                             Ok(resp) => {
                                 responder.respond(resp)?;
                                 agent.advertise_commands(&connection, &id)
@@ -1357,7 +1547,7 @@ async fn run_agent(yolo_flag: bool) -> agent_client_protocol::Result<()> {
                     let agent = agent.clone();
                     let connection = cx.clone();
                     cx.spawn(async move {
-                        if !agent.llm().has_api_key() {
+                        if !agent.llm().has_api_key() && !agent.refresh_credentials().await {
                             return responder.respond_with_error(auth_required_error());
                         }
                         agent.prompt(req, responder, connection).await
