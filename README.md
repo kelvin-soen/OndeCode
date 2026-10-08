@@ -77,6 +77,7 @@ conversation history, which Gemini requires for multi-step tool use.
 | `ONDE_CODE_SURFACE`  | `acp`                    | `tui` when launched by the interactive terminal UI; used in the Co-Authored-By trailer |
 | `ONDE_CODE_MODELS` | listed from `/models`      | comma-separated models offered in the editor's model picker |
 | `ONDE_CODE_CONTEXT_WINDOW` | `128000`     | context size reported to the editor in `usage_update` |
+| `ONDE_CODE_COMMAND_TIMEOUT_SECS` | `120`   | command execution timeout in seconds before cancellation |
 | `RUST_LOG`           | unset                    | logs go to stderr                            |
 
 ## Use from the terminal
@@ -120,6 +121,13 @@ Editors launch the agent with piped stdio, which selects ACP mode automatically 
 - `src/llm.rs` – streaming SSE client for chat completions, accumulates tool-call deltas
 - `src/tools.rs` – tool schemas and execution, permission flow, client fs/terminal routing
 - `src/tui.rs` – ratatui terminal UI; an ACP client that spawns the agent as a subprocess
+
+## Protocol compliance
+
+`onde-code` conforms to the Agent Client Protocol (ACP) v1 baseline:
+- **Absolute paths**: `cwd`, `additionalDirectories`, `ToolCallLocation.path`, `Diff.path`, and terminal `cwd` are strictly validated and normalized to absolute paths. Session lifecycle requests (`session/new`, `session/load`, `session/resume`) with relative paths are rejected with `invalid_params`.
+- **Plans (`AgentPlan`)**: `sessionUpdate: "plan"` is optional in ACP v1. Because general chat completion backends do not reliably emit structured, machine-verifiable step plans across different models, `onde-code` does not generate heuristic or hallucinated plan updates.
+- **Tools & MCP**: Supports both builtin workspace tools (`read_file`, `write_file`, `edit_file`, `list_directory`, `run_command`) and external MCP servers over stdio specified per session.
 
 ## License
 
