@@ -8,7 +8,23 @@ permissions:
   contents: write
 
 jobs:
+  # The binary reports CARGO_PKG_VERSION in `initialize` and in commit trailers, so a tag that
+  # doesn't match Cargo.toml ships the wrong version (v0.4.0 went out reporting 0.3.1).
+  verify-version:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Tag matches Cargo.toml
+        shell: bash
+        run: |
+          crate=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          if [ "$GITHUB_REF_NAME" != "v$crate" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml version $crate"
+            exit 1
+          fi
+
   build:
+    needs: verify-version
     strategy:
       fail-fast: false
       matrix:
@@ -48,3 +64,17 @@ jobs:
           gh release create "$GITHUB_REF_NAME" --verify-tag --generate-notes \
             || gh release view "$GITHUB_REF_NAME" >/dev/null
           gh release upload "$GITHUB_REF_NAME" "$asset" --clobber
+
+  # One checksums.txt for all archives; the ACP registry entry pins these sha256 values.
+  checksums:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Upload checksums.txt
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release download "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+            --pattern 'onde-code-*' --dir dist
+          (cd dist && sha256sum onde-code-* > checksums.txt && cat checksums.txt)
+          gh release upload "$GITHUB_REF_NAME" dist/checksums.txt --repo "$GITHUB_REPOSITORY" --clobber
