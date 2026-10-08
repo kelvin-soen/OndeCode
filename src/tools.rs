@@ -4,6 +4,7 @@
 
 use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -40,7 +41,9 @@ pub struct ToolCtx {
     pub roots: Vec<PathBuf>,
     pub caps: ClientCapabilities,
     pub cancel: CancellationToken,
-    pub yolo: bool,
+    /// Approve every tool call without asking. Shared with the session so toggling the
+    /// `auto_approve` config option takes effect mid-turn.
+    pub auto_approve: Arc<AtomicBool>,
     /// Tool names the user chose "always allow" for in this session.
     pub always_allowed: Arc<Mutex<HashSet<String>>>,
     /// Tool names the user chose "always reject" for in this session.
@@ -552,7 +555,7 @@ impl ToolCtx {
         if self.always_rejected.lock().unwrap().contains(tool) {
             return Ok(false);
         }
-        if self.yolo || self.always_allowed.lock().unwrap().contains(tool) {
+        if self.auto_approve.load(Ordering::Relaxed) || self.always_allowed.lock().unwrap().contains(tool) {
             return Ok(true);
         }
         let mut fields = ToolCallUpdateFields::new();

@@ -13,12 +13,14 @@ use std::io::IsTerminal;
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use agent_client_protocol::schema::v1::{
     AgentAuthCapabilities, AgentCapabilities, AuthMethod, AuthMethodTerminal, AuthenticateRequest,
-    AuthenticateResponse, DeleteSessionRequest, DeleteSessionResponse, EmbeddedResource,
+    AuthenticateResponse, AvailableCommand, AvailableCommandsUpdate, ConfigOptionUpdate,
+    DeleteSessionRequest, DeleteSessionResponse, EmbeddedResource,
     LogoutCapabilities, LogoutRequest, LogoutResponse, MessageId, SessionDeleteCapabilities,
     ReadTextFileRequest, TextResourceContents, UsageUpdate, CancelNotification, ClientCapabilities,
     CloseSessionRequest, CloseSessionResponse, ContentBlock, ContentChunk,
@@ -43,6 +45,8 @@ use tools::{ToolCtx, ToolOutcome};
 const MAX_TURNS: usize = 50;
 /// Id of the session config option that selects the model.
 const MODEL_CONFIG_ID: &str = "model";
+/// Id of the boolean session config option that skips permission prompts.
+const AUTO_APPROVE_CONFIG_ID: &str = "auto_approve";
 
 /// Context window reported in `usage_update` when ONDE_CODE_CONTEXT_WINDOW is unset.
 const DEFAULT_CONTEXT_WINDOW: u64 = 128_000;
@@ -71,6 +75,8 @@ struct Session {
     messages: Vec<Value>,
     cancel: CancellationToken,
     always_allowed: Arc<Mutex<HashSet<String>>>,
+    /// Approve tool calls without asking; the `auto_approve` config option.
+    auto_approve: Arc<AtomicBool>,
     /// Connected MCP servers for this session (stdio transport).
     mcp: Arc<tokio::sync::Mutex<mcp::McpRegistry>>,
     always_rejected: Arc<Mutex<HashSet<String>>>,
@@ -210,49 +216,163 @@ impl CoderAgent {
         *self.models.lock().await = None;
     }
 
-    async fn config_options(&self, current: &str) -> Vec<SessionConfigOption> {
+    /// Whether the client advertised `session.configOptions.boolean`, which ACP requires
+    /// before an agent may offer `type: "boolean"` options.
+    fn boolean_options_supported(&self) -> bool {
+        self.client_caps
+            .lock()
+            .unwrap()
+            .session
+            .as_ref()
+            .and_then(|s| s.config_options.as_ref())
+            .is_some_and(|c| c.boolean.is_some())
+    }
+
+    async fn config_options(&self, model: &str, auto_approve: bool) -> Vec<SessionConfigOption> {
         let options = self
             .models()
             .await
             .into_iter()
             .map(|id| SessionConfigSelectOption::new(id.clone(), id))
             .collect();
-        vec![
+        let mut config = vec![
             SessionConfigOption::select(
                 MODEL_CONFIG_ID,
                 "Model",
-                current.to_string(),
+                model.to_string(),
                 SessionConfigSelectOptions::Ungrouped(options),
             )
             .category(SessionConfigOptionCategory::Model),
-        ]
+        ];
+        if self.boolean_options_supported() {
+            config.push(
+                SessionConfigOption::boolean(
+                    AUTO_APPROVE_CONFIG_ID,
+                    "Auto-approve actions",
+                    auto_approve,
+                )
+                .description("Edit files and run commands without asking for permission"),
+            );
+        }
+        config
+    }
+
+    /// The model and auto-approve setting of a session, for building its config options.
+    fn session_settings(&self, session_id: &SessionId) -> Option<(String, bool)> {
+        self.sessions
+            .lock()
+            .unwrap()
+            .get(session_id)
+            .map(|s| (s.model.clone(), s.auto_approve.load(Ordering::Relaxed)))
     }
 
     async fn set_config_option(
         &self,
         req: SetSessionConfigOptionRequest,
+        connection: &ConnectionTo<Client>,
     ) -> agent_client_protocol::Result<SetSessionConfigOptionResponse> {
         let invalid = |msg: String| agent_client_protocol::Error::invalid_params().data(msg);
-        if &*req.config_id.0 != MODEL_CONFIG_ID {
-            return Err(invalid(format!(
-                "unknown config option {}",
-                req.config_id.0
-            )));
+        let unknown_session = || invalid(format!("unknown session {}", req.session_id));
+        match &*req.config_id.0 {
+            MODEL_CONFIG_ID => {
+                let Some(model) = req.value.as_value_id().map(|v| v.0.to_string()) else {
+                    return Err(invalid("model must be a value id".into()));
+                };
+                if !self.models().await.contains(&model) {
+                    return Err(invalid(format!("unknown model {model}")));
+                }
+                match self.sessions.lock().unwrap().get_mut(&req.session_id) {
+                    Some(s) => s.model = model.clone(),
+                    None => return Err(unknown_session()),
+                }
+                tracing::info!("session {} now uses model {model}", req.session_id);
+            }
+            AUTO_APPROVE_CONFIG_ID if self.boolean_options_supported() => {
+                let Some(on) = req.value.as_bool() else {
+                    return Err(invalid("auto_approve must be a boolean".into()));
+                };
+                match self.sessions.lock().unwrap().get(&req.session_id) {
+                    Some(s) => s.auto_approve.store(on, Ordering::Relaxed),
+                    None => return Err(unknown_session()),
+                }
+                tracing::info!("session {} auto-approve {on}", req.session_id);
+            }
+            other => return Err(invalid(format!("unknown config option {other}"))),
         }
-        let Some(model) = req.value.as_value_id().map(|v| v.0.to_string()) else {
-            return Err(invalid("model must be a value id".into()));
-        };
-        if !self.models().await.contains(&model) {
-            return Err(invalid(format!("unknown model {model}")));
-        }
-        match self.sessions.lock().unwrap().get_mut(&req.session_id) {
-            Some(s) => s.model = model.clone(),
-            None => return Err(invalid(format!("unknown session {}", req.session_id))),
-        }
-        tracing::info!("session {} now uses model {model}", req.session_id);
-        Ok(SetSessionConfigOptionResponse::new(
-            self.config_options(&model).await,
+        let (model, auto_approve) = self
+            .session_settings(&req.session_id)
+            .ok_or_else(unknown_session)?;
+        let options = self.config_options(&model, auto_approve).await;
+        // Tell every view of the session about the change, not just the requester.
+        connection.send_notification(SessionNotification::new(
+            req.session_id.clone(),
+            SessionUpdate::ConfigOptionUpdate(ConfigOptionUpdate::new(options.clone())),
+        ))?;
+        Ok(SetSessionConfigOptionResponse::new(options))
+    }
+
+    /// Advertise the slash commands handled by [`Self::run_command`].
+    fn advertise_commands(
+        &self,
+        connection: &ConnectionTo<Client>,
+        session_id: &SessionId,
+    ) -> agent_client_protocol::Result<()> {
+        let commands = vec![
+            AvailableCommand::new("models", "List the models this agent can use"),
+            AvailableCommand::new("setup", "How to configure the provider and API key"),
+        ];
+        connection.send_notification(SessionNotification::new(
+            session_id.clone(),
+            SessionUpdate::AvailableCommandsUpdate(AvailableCommandsUpdate::new(commands)),
         ))
+    }
+
+    /// Answer an advertised slash command locally, without calling the model. Returns
+    /// `None` when the prompt is not one of our commands, so it goes to the model as usual.
+    async fn run_command(
+        &self,
+        request: &PromptRequest,
+        connection: &ConnectionTo<Client>,
+    ) -> agent_client_protocol::Result<Option<StopReason>> {
+        let [ContentBlock::Text(text)] = request.prompt.as_slice() else {
+            return Ok(None);
+        };
+        let reply = match text.text.split_whitespace().next() {
+            Some("/models") => {
+                let Some((current, _)) = self.session_settings(&request.session_id) else {
+                    return Err(agent_client_protocol::Error::invalid_params()
+                        .data(format!("unknown session {}", request.session_id)));
+                };
+                let list = self
+                    .models()
+                    .await
+                    .into_iter()
+                    .map(|m| {
+                        if m == current {
+                            format!("- `{m}` (current)")
+                        } else {
+                            format!("- `{m}`")
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                format!("Available models:\n\n{list}\n\nSwitch with the model picker.")
+            }
+            Some("/setup") => "Run `onde-code --setup` in a terminal to choose a provider and \
+                store an API key, then sign in again from your editor. You can also set \
+                `OPENAI_BASE_URL`, `OPENAI_API_KEY` and `OPENAI_MODEL` (or `CONDENSE_API_KEY`) \
+                in the agent's environment."
+                .to_string(),
+            _ => return Ok(None),
+        };
+        connection.send_notification(SessionNotification::new(
+            request.session_id.clone(),
+            SessionUpdate::AgentMessageChunk(
+                ContentChunk::new(reply.into())
+                    .message_id(MessageId::new(uuid::Uuid::new_v4().to_string())),
+            ),
+        ))?;
+        Ok(Some(StopReason::EndTurn))
     }
 
     async fn new_session(
@@ -275,7 +395,7 @@ impl CoderAgent {
         let roots: Vec<PathBuf> = roots.into_iter().map(|r| tools::absolutize(&r)).collect();
         let id = SessionId::new(uuid::Uuid::new_v4().to_string());
         let model = self.llm().model().to_string();
-        let options = self.config_options(&model).await;
+        let options = self.config_options(&model, self.yolo).await;
         // ACP v1: connect to all stdio MCP servers the client specifies.
         let mcp_registry = mcp::McpRegistry::connect_all(&mcp_servers).await;
         let session = Session {
@@ -287,6 +407,7 @@ impl CoderAgent {
             roots,
             cancel: CancellationToken::new(),
             always_allowed: Arc::default(),
+            auto_approve: Arc::new(AtomicBool::new(self.yolo)),
             mcp: Arc::new(tokio::sync::Mutex::new(mcp_registry)),
             always_rejected: Arc::default(),
             title: None,
@@ -356,7 +477,7 @@ impl CoderAgent {
             return Err(agent_client_protocol::Error::invalid_params()
                 .data("additionalDirectories entries must be absolute paths"));
         }
-        let (model, messages) = {
+        let (model, auto_approve, messages) = {
             let mut sessions = self.sessions.lock().unwrap();
             let s = sessions.get_mut(&session_id).ok_or_else(|| {
                 agent_client_protocol::Error::invalid_params()
@@ -371,7 +492,11 @@ impl CoderAgent {
                     .collect();
             }
             s.updated_at = now_secs();
-            (s.model.clone(), s.messages.clone())
+            (
+                s.model.clone(),
+                s.auto_approve.load(Ordering::Relaxed),
+                s.messages.clone(),
+            )
         };
         let notify = |update: SessionUpdate| {
             connection.send_notification(SessionNotification::new(session_id.clone(), update))
@@ -424,7 +549,7 @@ impl CoderAgent {
                 _ => {}
             }
         }
-        let options = self.config_options(&model).await;
+        let options = self.config_options(&model, auto_approve).await;
         // ACP v1: connect to MCP servers specified in the load request.
         if !req.mcp_servers.is_empty() {
             let registry = mcp::McpRegistry::connect_all(&req.mcp_servers).await;
@@ -450,7 +575,7 @@ impl CoderAgent {
             return Err(agent_client_protocol::Error::invalid_params()
                 .data("additionalDirectories entries must be absolute paths"));
         }
-        let model = {
+        let (model, auto_approve) = {
             let mut sessions = self.sessions.lock().unwrap();
             let s = sessions.get_mut(&session_id).ok_or_else(|| {
                 agent_client_protocol::Error::invalid_params()
@@ -465,7 +590,7 @@ impl CoderAgent {
                     .collect();
             }
             s.updated_at = now_secs();
-            s.model.clone()
+            (s.model.clone(), s.auto_approve.load(Ordering::Relaxed))
         };
         // ACP v1: connect to MCP servers specified in the resume request.
         if !req.mcp_servers.is_empty() {
@@ -474,7 +599,7 @@ impl CoderAgent {
                 s.mcp = Arc::new(tokio::sync::Mutex::new(registry));
             }
         }
-        let options = self.config_options(&model).await;
+        let options = self.config_options(&model, auto_approve).await;
         Ok(ResumeSessionResponse::new().config_options(options))
     }
 
@@ -502,6 +627,11 @@ impl CoderAgent {
         responder: Responder<PromptResponse>,
         connection: ConnectionTo<Client>,
     ) -> agent_client_protocol::Result<()> {
+        match self.run_command(&request, &connection).await {
+            Ok(Some(stop)) => return responder.respond(PromptResponse::new(stop)),
+            Ok(None) => {}
+            Err(e) => return responder.respond_with_error(e),
+        }
         match self.run_turn(request, connection).await {
             Ok(stop) => responder.respond(PromptResponse::new(stop)),
             Err(e) => responder.respond_with_error(
@@ -521,7 +651,17 @@ impl CoderAgent {
         let prompt_text = prompt_to_text(&prompt);
         let prompt_content = prompt_to_content(&prompt);
         // Take the history out while the turn runs; it's put back at the end.
-        let (cwd, roots, model, mut messages, cancel, always_allowed, always_rejected, mcp) = {
+        let (
+            cwd,
+            roots,
+            model,
+            mut messages,
+            cancel,
+            always_allowed,
+            auto_approve,
+            always_rejected,
+            mcp,
+        ) = {
             let mut sessions = self.sessions.lock().unwrap();
             let s = sessions
                 .get_mut(&session_id)
@@ -538,6 +678,7 @@ impl CoderAgent {
                 std::mem::take(&mut s.messages),
                 s.cancel.clone(),
                 s.always_allowed.clone(),
+                s.auto_approve.clone(),
                 s.always_rejected.clone(),
                 s.mcp.clone(),
             )
@@ -551,7 +692,7 @@ impl CoderAgent {
             roots,
             caps,
             cancel: cancel.clone(),
-            yolo: self.yolo,
+            auto_approve,
             always_allowed,
             always_rejected,
         };
@@ -1079,6 +1220,7 @@ async fn run_agent(yolo_flag: bool) -> agent_client_protocol::Result<()> {
                 async move |req: NewSessionRequest, responder, cx| {
                     // Listing models is a network call; keep it off the dispatch loop.
                     let agent = agent.clone();
+                    let connection = cx.clone();
                     cx.spawn(async move {
                         if !agent.llm().has_api_key() {
                             return responder.respond_with_error(auth_required_error());
@@ -1087,7 +1229,11 @@ async fn run_agent(yolo_flag: bool) -> agent_client_protocol::Result<()> {
                             .new_session(req.cwd, req.additional_directories, req.mcp_servers)
                             .await
                         {
-                            Ok(resp) => responder.respond(resp),
+                            Ok(resp) => {
+                                let id = resp.session_id.clone();
+                                responder.respond(resp)?;
+                                agent.advertise_commands(&connection, &id)
+                            }
                             Err(e) => responder.respond_with_error(e),
                         }
                     })
@@ -1114,8 +1260,12 @@ async fn run_agent(yolo_flag: bool) -> agent_client_protocol::Result<()> {
                     let agent = agent.clone();
                     let connection = cx.clone();
                     cx.spawn(async move {
+                        let id = req.session_id.clone();
                         match agent.load_session(req, &connection).await {
-                            Ok(resp) => responder.respond(resp),
+                            Ok(resp) => {
+                                responder.respond(resp)?;
+                                agent.advertise_commands(&connection, &id)
+                            }
                             Err(e) => responder.respond_with_error(e),
                         }
                     })
@@ -1128,9 +1278,14 @@ async fn run_agent(yolo_flag: bool) -> agent_client_protocol::Result<()> {
                 let agent = agent.clone();
                 async move |req: ResumeSessionRequest, responder, cx| {
                     let agent = agent.clone();
+                    let connection = cx.clone();
                     cx.spawn(async move {
+                        let id = req.session_id.clone();
                         match agent.resume_session(req).await {
-                            Ok(resp) => responder.respond(resp),
+                            Ok(resp) => {
+                                responder.respond(resp)?;
+                                agent.advertise_commands(&connection, &id)
+                            }
                             Err(e) => responder.respond_with_error(e),
                         }
                     })
@@ -1154,8 +1309,9 @@ async fn run_agent(yolo_flag: bool) -> agent_client_protocol::Result<()> {
                 let agent = agent.clone();
                 async move |req: SetSessionConfigOptionRequest, responder, cx| {
                     let agent = agent.clone();
+                    let connection = cx.clone();
                     cx.spawn(async move {
-                        match agent.set_config_option(req).await {
+                        match agent.set_config_option(req, &connection).await {
                             Ok(resp) => responder.respond(resp),
                             Err(e) => responder.respond_with_error(e),
                         }

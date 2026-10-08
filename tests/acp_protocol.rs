@@ -13,6 +13,29 @@ use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 /// Mock chat-completions endpoint: streams one text reply with a usage chunk and records
 /// every request body it receives.
 async fn start_mock_llm(bodies: Arc<Mutex<Vec<Value>>>) -> String {
+    start_scripted_llm(bodies, vec![text_reply()]).await
+}
+
+/// The SSE events of a plain "Hello there" reply with usage.
+fn text_reply() -> Vec<Value> {
+    vec![
+        json!({"choices":[{"index":0,"delta":{"role":"assistant","content":"Hello"}}]}),
+        json!({"choices":[{"index":0,"delta":{"content":" there"},"finish_reason":"stop"}]}),
+        json!({"choices":[],"usage":{"prompt_tokens":120,"completion_tokens":3,"total_tokens":123}}),
+    ]
+}
+
+/// The SSE events of a single tool call.
+fn tool_call_reply(name: &str, arguments: Value) -> Vec<Value> {
+    vec![json!({"choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{
+        "index":0,"id":"call_1","type":"function",
+        "function":{"name":name,"arguments":arguments.to_string()}
+    }]},"finish_reason":"tool_calls"}]})]
+}
+
+/// Mock endpoint that answers the n-th request with `replies[n]` (the last reply repeats).
+async fn start_scripted_llm(bodies: Arc<Mutex<Vec<Value>>>, replies: Vec<Vec<Value>>) -> String {
+    let replies = Arc::new(replies);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -21,6 +44,7 @@ async fn start_mock_llm(bodies: Arc<Mutex<Vec<Value>>>) -> String {
                 return;
             };
             let bodies = bodies.clone();
+            let replies = replies.clone();
             tokio::spawn(async move {
                 let mut buf = Vec::new();
                 let mut chunk = [0u8; 8192];
@@ -45,15 +69,11 @@ async fn start_mock_llm(bodies: Arc<Mutex<Vec<Value>>>) -> String {
                         }
                     }
                 };
-                bodies
-                    .lock()
-                    .unwrap()
-                    .push(serde_json::from_slice(&body).unwrap_or(Value::Null));
-                let events = [
-                    json!({"choices":[{"index":0,"delta":{"role":"assistant","content":"Hello"}}]}),
-                    json!({"choices":[{"index":0,"delta":{"content":" there"},"finish_reason":"stop"}]}),
-                    json!({"choices":[],"usage":{"prompt_tokens":120,"completion_tokens":3,"total_tokens":123}}),
-                ];
+                let events = {
+                    let mut bodies = bodies.lock().unwrap();
+                    bodies.push(serde_json::from_slice(&body).unwrap_or(Value::Null));
+                    replies[(bodies.len() - 1).min(replies.len() - 1)].clone()
+                };
                 let mut sse = String::new();
                 for e in events {
                     sse.push_str(&format!("data: {e}\n\n"));
@@ -323,6 +343,161 @@ async fn session_lifecycle_rejects_relative_paths() {
     // Relative cwd is rejected on session/load
     let r = agent.call("session/load", json!({"sessionId": sid, "cwd": "relative/path"})).await;
     assert_eq!(r["error"]["code"], -32602, "expected invalid_params: {r}");
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// The config options in a response or `config_option_update`, keyed by id.
+fn option<'a>(options: &'a Value, id: &str) -> Option<&'a Value> {
+    options.as_array().unwrap().iter().find(|o| o["id"] == id)
+}
+
+#[tokio::test]
+async fn auto_approve_is_a_boolean_option_only_for_capable_clients() {
+    let home = temp_dir("auto-approve");
+    let env = llm_env("http://127.0.0.1:9/v1");
+
+    // Without `session.configOptions.boolean` the option is neither offered nor settable.
+    let mut agent = Agent::spawn(&home, &as_refs(&env));
+    agent.initialize(false).await;
+    let r = agent.call("session/new", json!({"cwd": home, "mcpServers": []})).await;
+    let sid = r["result"]["sessionId"].as_str().unwrap().to_string();
+    assert!(option(&r["result"]["configOptions"], "auto_approve").is_none(), "{r}");
+    let r = agent
+        .call(
+            "session/set_config_option",
+            json!({"sessionId": sid, "configId": "auto_approve", "type": "boolean", "value": true}),
+        )
+        .await;
+    assert_eq!(r["error"]["code"], -32602, "{r}");
+
+    let mut agent = Agent::spawn(&home, &as_refs(&env));
+    agent
+        .call(
+            "initialize",
+            json!({"protocolVersion":1,"clientCapabilities":{"session":{"configOptions":{"boolean":{}}}}}),
+        )
+        .await;
+    let r = agent.call("session/new", json!({"cwd": home, "mcpServers": []})).await;
+    let sid = r["result"]["sessionId"].as_str().unwrap().to_string();
+    let opt = option(&r["result"]["configOptions"], "auto_approve").expect("offered");
+    assert_eq!(opt["type"], "boolean");
+    assert_eq!(opt["currentValue"], false);
+
+    // A select value for a boolean option is rejected.
+    let r = agent
+        .call(
+            "session/set_config_option",
+            json!({"sessionId": sid, "configId": "auto_approve", "value": "on"}),
+        )
+        .await;
+    assert_eq!(r["error"]["code"], -32602, "{r}");
+
+    let r = agent
+        .call(
+            "session/set_config_option",
+            json!({"sessionId": sid, "configId": "auto_approve", "type": "boolean", "value": true}),
+        )
+        .await;
+    let opt = option(&r["result"]["configOptions"], "auto_approve").expect("in response");
+    assert_eq!(opt["currentValue"], true, "{r}");
+    let update = agent
+        .updates
+        .iter()
+        .map(|u| &u["update"])
+        .find(|u| u["sessionUpdate"] == "config_option_update")
+        .expect("config_option_update sent");
+    assert_eq!(option(&update["configOptions"], "auto_approve").unwrap()["currentValue"], true);
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[tokio::test]
+async fn auto_approve_skips_permission_requests() {
+    let home = temp_dir("auto-approve-write");
+    let bodies = Arc::new(Mutex::new(Vec::new()));
+    let base_url = start_scripted_llm(
+        bodies,
+        vec![
+            tool_call_reply("write_file", json!({"path": "out.txt", "content": "approved"})),
+            text_reply(),
+        ],
+    )
+    .await;
+    let env = llm_env(&base_url);
+    let mut agent = Agent::spawn(&home, &as_refs(&env));
+    agent
+        .call(
+            "initialize",
+            json!({"protocolVersion":1,"clientCapabilities":{"session":{"configOptions":{"boolean":{}}}}}),
+        )
+        .await;
+    let r = agent.call("session/new", json!({"cwd": home, "mcpServers": []})).await;
+    let sid = r["result"]["sessionId"].as_str().unwrap().to_string();
+    agent
+        .call(
+            "session/set_config_option",
+            json!({"sessionId": sid, "configId": "auto_approve", "type": "boolean", "value": true}),
+        )
+        .await;
+
+    // `call` panics on any client request, so a permission prompt would fail the test.
+    let r = agent
+        .call(
+            "session/prompt",
+            json!({"sessionId": sid, "prompt": [{"type":"text","text":"Write out.txt"}]}),
+        )
+        .await;
+    assert_eq!(r["result"]["stopReason"], "end_turn", "{r}");
+    assert_eq!(std::fs::read_to_string(home.join("out.txt")).unwrap(), "approved");
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[tokio::test]
+async fn slash_commands_are_advertised_and_answered_locally() {
+    let home = temp_dir("commands");
+    let bodies = Arc::new(Mutex::new(Vec::new()));
+    let base_url = start_mock_llm(bodies.clone()).await;
+    let env = llm_env(&base_url);
+    let mut agent = Agent::spawn(&home, &as_refs(&env));
+    agent.initialize(false).await;
+    let r = agent.call("session/new", json!({"cwd": home, "mcpServers": []})).await;
+    let sid = r["result"]["sessionId"].as_str().unwrap().to_string();
+
+    for (command, expect) in [("/models", "`mock-model` (current)"), ("/setup", "onde-code --setup")] {
+        let r = agent
+            .call(
+                "session/prompt",
+                json!({"sessionId": sid, "prompt": [{"type":"text","text": command}]}),
+            )
+            .await;
+        assert_eq!(r["result"]["stopReason"], "end_turn", "{r}");
+        let reply = agent
+            .updates
+            .iter()
+            .rev()
+            .map(|u| &u["update"])
+            .find(|u| u["sessionUpdate"] == "agent_message_chunk")
+            .expect("reply chunk");
+        assert!(reply["content"]["text"].as_str().unwrap().contains(expect), "{reply}");
+    }
+    assert!(bodies.lock().unwrap().is_empty(), "commands must not reach the model");
+
+    // The notification follows the session/new response, so it is recorded by now.
+    let commands = agent
+        .updates
+        .iter()
+        .map(|u| &u["update"])
+        .find(|u| u["sessionUpdate"] == "available_commands_update")
+        .expect("available_commands_update sent");
+    let names: Vec<&str> = commands["availableCommands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["models", "setup"]);
 
     std::fs::remove_dir_all(&home).ok();
 }
