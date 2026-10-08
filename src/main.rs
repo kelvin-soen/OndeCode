@@ -1048,7 +1048,8 @@ const MAX_LINKED_FILE_BYTES: usize = 256 * 1024;
 
 /// Replace `file://` resource links with embedded text contents so the model sees the file,
 /// reading through the client when it supports `fs/read_text_file` (unsaved buffers), else
-/// from disk. Links that can't be read are kept as references.
+/// from disk. A link to a selection (`#L10:20`) is inlined as just those lines. Links that
+/// can't be read are kept as references.
 async fn resolve_resource_links(
     blocks: &[ContentBlock],
     caps: &ClientCapabilities,
@@ -1058,7 +1059,7 @@ async fn resolve_resource_links(
     let mut out = Vec::with_capacity(blocks.len());
     for block in blocks {
         if let ContentBlock::ResourceLink(link) = block
-            && let Some(path) = file_uri_path(&link.uri)
+            && let Some(FileLink { path, lines }) = parse_file_link(&link.uri)
         {
             let text = if caps.fs.read_text_file {
                 connection
@@ -1072,7 +1073,14 @@ async fn resolve_resource_links(
                     .await
                     .map_err(|e| e.to_string())
             };
+            let text = match lines {
+                Some(range) => text.map(|t| slice_lines(&t, range)),
+                None => text,
+            };
             match text {
+                Ok(text) if lines.is_some() && text.is_empty() => {
+                    tracing::debug!("{} selects no lines", link.uri)
+                }
                 Ok(text) if text.len() <= MAX_LINKED_FILE_BYTES => {
                     out.push(ContentBlock::Resource(EmbeddedResource::new(
                         EmbeddedResourceResource::TextResourceContents(
@@ -1091,9 +1099,26 @@ async fn resolve_resource_links(
     out
 }
 
-/// Absolute path for a `file://` URI, percent-decoding the path.
-fn file_uri_path(uri: &str) -> Option<PathBuf> {
+/// A `file://` resource link: the absolute path, and the lines it selects, if any.
+#[derive(Debug, PartialEq)]
+struct FileLink {
+    path: PathBuf,
+    /// 1-based, inclusive.
+    lines: Option<(usize, usize)>,
+}
+
+/// Parse a `file://` URI, percent-decoding the path. Editors put more than the path in it:
+/// Zed links a selection as `file:///a.rs?column=5#L10:20` and a symbol as
+/// `file:///a.rs?symbol=main#L3:9`. The query is dropped and the fragment read as a line
+/// range; a literal `?` or `#` in a file name arrives percent-encoded, so splitting first is
+/// safe.
+fn parse_file_link(uri: &str) -> Option<FileLink> {
     let rest = uri.strip_prefix("file://")?;
+    let (rest, fragment) = match rest.split_once('#') {
+        Some((rest, fragment)) => (rest, Some(fragment)),
+        None => (rest, None),
+    };
+    let rest = rest.split_once('?').map_or(rest, |(rest, _)| rest);
     // Allow an authority of "" or "localhost"; reject other hosts.
     let path = if rest.starts_with('/') {
         rest
@@ -1116,7 +1141,31 @@ fn file_uri_path(uri: &str) -> Option<PathBuf> {
         }
     }
     let path = PathBuf::from(String::from_utf8(decoded).ok()?);
-    path.is_absolute().then_some(path)
+    path.is_absolute().then(|| FileLink {
+        path,
+        lines: fragment.and_then(parse_line_range),
+    })
+}
+
+/// A `#L10:20` fragment as a 1-based inclusive range. Accepts the forms Zed reads too:
+/// `L10:20`, `L10-20`, `L10-L20` and a single line `L10`.
+fn parse_line_range(fragment: &str) -> Option<(usize, usize)> {
+    let range = fragment.strip_prefix('L')?;
+    let (start, end) = range
+        .split_once(':')
+        .or_else(|| range.split_once('-'))
+        .unwrap_or((range, range));
+    let end = end.strip_prefix('L').unwrap_or(end);
+    let (start, end) = (start.parse::<usize>().ok()?, end.parse::<usize>().ok()?);
+    (start >= 1 && end >= start).then_some((start, end))
+}
+
+/// Lines `start..=end` (1-based) of `text`, keeping their line endings.
+fn slice_lines(text: &str, (start, end): (usize, usize)) -> String {
+    text.split_inclusive('\n')
+        .skip(start - 1)
+        .take(end - start + 1)
+        .collect()
 }
 
 /// Flatten ACP prompt content into text for the model.
@@ -1631,4 +1680,66 @@ async fn run_agent(yolo_flag: bool) -> agent_client_protocol::Result<()> {
         )
         .connect_to(Stdio::new())
         .await
+}
+
+#[cfg(test)]
+mod file_link_tests {
+    use super::*;
+
+    fn link(uri: &str) -> Option<FileLink> {
+        parse_file_link(uri)
+    }
+
+    #[test]
+    fn plain_paths_decode_and_must_be_absolute() {
+        assert_eq!(
+            link("file:///tmp/notes%20v2.txt"),
+            Some(FileLink {
+                path: "/tmp/notes v2.txt".into(),
+                lines: None
+            })
+        );
+        assert_eq!(
+            link("file://localhost/a").unwrap().path,
+            PathBuf::from("/a")
+        );
+        assert_eq!(link("file://other-host/a"), None);
+        assert_eq!(link("https://example.com/a"), None);
+    }
+
+    #[test]
+    fn zed_selection_and_symbol_links() {
+        let selection = link("file:///src/main.rs?column=5#L10:20").unwrap();
+        assert_eq!(selection.path, PathBuf::from("/src/main.rs"));
+        assert_eq!(selection.lines, Some((10, 20)));
+        let symbol = link("file:///src/lib.rs?symbol=main#L3:9").unwrap();
+        assert_eq!(
+            (symbol.path, symbol.lines),
+            ("/src/lib.rs".into(), Some((3, 9)))
+        );
+        // An encoded `#` is part of the file name, not a fragment.
+        assert_eq!(
+            link("file:///a%23b.rs").unwrap().path,
+            PathBuf::from("/a#b.rs")
+        );
+    }
+
+    #[test]
+    fn line_range_forms() {
+        assert_eq!(parse_line_range("L10:20"), Some((10, 20)));
+        assert_eq!(parse_line_range("L10-20"), Some((10, 20)));
+        assert_eq!(parse_line_range("L10-L20"), Some((10, 20)));
+        assert_eq!(parse_line_range("L7"), Some((7, 7)));
+        for bad in ["L0:3", "L5:2", "10:20", "Lx", ""] {
+            assert_eq!(parse_line_range(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn slices_inclusive_lines() {
+        let text = "one\ntwo\nthree\nfour";
+        assert_eq!(slice_lines(text, (2, 3)), "two\nthree\n");
+        assert_eq!(slice_lines(text, (4, 9)), "four");
+        assert_eq!(slice_lines(text, (5, 6)), "");
+    }
 }

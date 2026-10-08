@@ -751,3 +751,53 @@ async fn terminal_auth_then_reopen_without_authenticate() {
 
     std::fs::remove_dir_all(&home).ok();
 }
+
+#[tokio::test]
+async fn selection_links_inline_only_the_selected_lines() {
+    // Zed links a selection as file:///path?column=N#L<start>:<end>.
+    let home = temp_dir("selection");
+    let file = home.join("lib.rs");
+    std::fs::write(
+        &file,
+        "line-one-x1\nline-two-x2\nline-three-x3\nline-four-x4\n",
+    )
+    .unwrap();
+    let uri = format!("file://{}?column=3#L2:3", file.display());
+
+    let bodies = Arc::new(Mutex::new(Vec::new()));
+    let base_url = start_mock_llm(bodies.clone()).await;
+    let env = llm_env(&base_url);
+    let mut agent = Agent::spawn(&home, &as_refs(&env));
+    agent.initialize(false).await;
+    let r = agent
+        .call("session/new", json!({"cwd": home, "mcpServers": []}))
+        .await;
+    let sid = r["result"]["sessionId"].as_str().unwrap().to_string();
+
+    let r = agent
+        .call(
+            "session/prompt",
+            json!({"sessionId": sid, "prompt": [
+                {"type":"text","text":"Explain this."},
+                {"type":"resource_link","uri": uri,"name":"lib.rs (2:3)"}
+            ]}),
+        )
+        .await;
+    assert_eq!(r["result"]["stopReason"], "end_turn", "{r}");
+
+    let sent = bodies.lock().unwrap()[0].to_string();
+    assert!(
+        sent.contains("line-two-x2") && sent.contains("line-three-x3"),
+        "{sent}"
+    );
+    assert!(
+        !sent.contains("line-one-x1") && !sent.contains("line-four-x4"),
+        "{sent}"
+    );
+    assert!(
+        sent.contains("#L2:3"),
+        "the model should see which lines: {sent}"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+}

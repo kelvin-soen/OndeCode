@@ -114,7 +114,8 @@ protocol an editor does, so the terminal and the editor exercise the same code p
   server that fails to start is logged and skipped; the session still opens.
 - **Prompts:** text, images (sent to the model as vision input), embedded resources and
   `resource_link`s. `file://` links are read (through the client's
-  `fs/read_text_file` when advertised) and inlined.
+  `fs/read_text_file` when advertised) and inlined. A link to a selection (`#L10:20`, as Zed
+  sends for selected text and symbols) inlines just those lines.
 - **Streaming:** answer text and reasoning (`reasoning_content` / `reasoning` deltas) stream as
   message and thought chunks with stable message ids, plus a `usage_update` after each model call.
 - **Cancellation:** `session/cancel` stops the turn with `cancelled`, drops any open permission
