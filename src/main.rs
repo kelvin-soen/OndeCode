@@ -530,8 +530,7 @@ impl CoderAgent {
                             let name = tc
                                 .pointer("/function/name")
                                 .and_then(|v| v.as_str())
-                                .unwrap_or("unknown")
-                                .to_string();
+                                .map(str::to_string);
                             let args_str = tc
                                 .pointer("/function/arguments")
                                 .and_then(|v| v.as_str())
@@ -540,7 +539,8 @@ impl CoderAgent {
                             let args: Value =
                                 serde_json::from_str(&args_str).unwrap_or_else(|_| json!({}));
                             notify(SessionUpdate::ToolCall(
-                                ToolCall::new(id, name.clone())
+                                ToolCall::new(id, name.as_deref().unwrap_or("unknown"))
+                                    .name(name)
                                     .status(ToolCallStatus::Completed)
                                     .raw_input(args),
                             ))?;
@@ -790,6 +790,7 @@ impl CoderAgent {
                 };
                 notify(SessionUpdate::ToolCall(
                     ToolCall::new(tc.id.clone(), title)
+                        .name(tc.name.clone())
                         .kind(kind)
                         .status(ToolCallStatus::InProgress)
                         .locations(locations)

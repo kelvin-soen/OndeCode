@@ -229,6 +229,8 @@ struct Captured {
     diff_paths: Vec<PathBuf>,
     /// Tool calls seen as `session/update` ToolCall notifications: (title, locations).
     tool_call_details: Vec<(String, Vec<PathBuf>)>,
+    /// `ToolCall.name` of each tool call, in order.
+    tool_names: Vec<Option<String>>,
     /// Permission requests the agent withdrew with `$/cancel_request`.
     permission_cancel_requests: usize,
 }
@@ -396,6 +398,7 @@ impl Harness {
                         }
                         SessionUpdate::ToolCall(tc) => {
                             c.tool_calls.push((tc.title.clone(), tc.status));
+                            c.tool_names.push(tc.name.clone());
                             c.tool_call_details.push((
                                 tc.title.clone(),
                                 tc.locations
@@ -700,6 +703,12 @@ async fn acp_full_agent_loop_with_tools() {
         c.text.contains("Done: created hello.txt"),
         "streamed text missing: {}",
         c.text
+    );
+    // ToolCall.name carries the programmatic tool name next to the human title.
+    assert_eq!(
+        c.tool_names,
+        ["list_directory", "write_file", "read_file", "run_command"]
+            .map(|n| Some(n.to_string()))
     );
     // 4 tool calls started; the 2 writes asked for permission (reads/list don't).
     assert_eq!(
