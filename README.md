@@ -1,10 +1,12 @@
 # Onde Code
 
-`onde-code` is a coding agent for the [Agent Client Protocol](https://agentclientprotocol.com)
-(ACP), written in Rust on the official [ACP Rust SDK](https://github.com/agentclientprotocol/rust-sdk).
-It runs inside any ACP editor (Zed, JetBrains, Neovim and others) or in your terminal with its own
-TUI, and it talks to any OpenAI-compatible `/chat/completions` endpoint: Onde Cloud, condense.chat,
-OpenAI, OpenRouter, or a local server like Ollama, vLLM, llama.cpp or LM Studio.
+Onde Code is Onde Inference's ACP-compatible coding agent for model fine-tuning and deployment.
+
+It speaks the [Agent Client Protocol](https://agentclientprotocol.com) (ACP), so it runs inside any
+ACP editor (Zed, JetBrains, Neovim and others), and it has its own TUI for the terminal. It is
+written in Rust on the official [ACP Rust SDK](https://github.com/agentclientprotocol/rust-sdk).
+Inference comes from [Onde Inference](https://ondeinference.com) by default, and the agent also
+accepts any OpenAI API compatible endpoint.
 
 It is one static binary with no runtime to install. It implements ACP v1, including the optional
 parts editors actually use: session list/resume/close/delete, multi-root workspaces, MCP servers,
@@ -58,8 +60,7 @@ Zed, add it to `settings.json`:
       "command": "/absolute/path/to/onde-code",
       "args": ["--acp"],
       "env": {
-        "OPENAI_BASE_URL": "http://localhost:11434/v1",
-        "OPENAI_MODEL": "qwen2.5-coder:14b"
+        "ONDE_API_KEY": "APP_ID:APP_SECRET"
       }
     }
   }
@@ -121,42 +122,26 @@ chat completion models don't produce plans reliably enough to report as structur
 
 ## Providers
 
-Three providers are built in. `ONDE_CODE_PROVIDER` picks one; without it, the first key found
-wins, in this order:
+Onde Code uses Onde Inference by default. Set `ONDE_API_KEY` to the `app-id:app-secret` pair from
+the Onde dashboard (or store it with `--setup`). The agent then talks to
+`https://cloud.ondeinference.com/v1` and uses `onde-kkk` unless `OPENAI_MODEL` names another model;
+`onde-code --list-models` prints the ids your key can use.
 
-| Provider | Key env var | Base URL | Default model |
-|----------|-------------|----------|---------------|
-| `onde` ([Onde Cloud](https://ondeinference.com/cloud)) | `ONDE_API_KEY` (`app-id:app-secret` from the Onde dashboard) | `https://cloud.ondeinference.com/v1` | `onde-kkk` |
-| `condense` ([condense.chat](https://condense.chat)) | `CONDENSE_API_KEY` | `https://api.condense.chat/openai/v1` | `google/gemini-3.8-flash` |
-| `openai` | `OPENAI_API_KEY` | `https://api.openai.com/v1` | `gpt-4o-mini` |
-
-Any other OpenAI-compatible server works through `OPENAI_BASE_URL`, `OPENAI_API_KEY` and
-`OPENAI_MODEL`. The model has to support tool (function) calling.
+It also accepts any OpenAI API compatible endpoint. Point it there with `OPENAI_BASE_URL`,
+`OPENAI_API_KEY` and `OPENAI_MODEL`. The model has to support tool (function) calling. If
+`ONDE_API_KEY` is also in the environment, set `ONDE_CODE_PROVIDER=openai` as well.
 
 ```sh
-ONDE_API_KEY=APP_ID:APP_SECRET onde-code                     # Onde Cloud
-CONDENSE_API_KEY=... onde-code                               # Gemini via condense
-OPENAI_BASE_URL=http://localhost:11434/v1 OPENAI_MODEL=qwen2.5-coder:14b onde-code   # Ollama
-onde-code --list-models                                      # what the endpoint serves
+ONDE_API_KEY=APP_ID:APP_SECRET onde-code
+OPENAI_BASE_URL=https://your-endpoint/v1 OPENAI_API_KEY=... OPENAI_MODEL=your-model onde-code
+onde-code --list-models     # what the configured endpoint serves
 ```
-
-**Onde Cloud** models are tier ids (`GET https://cloud.ondeinference.com/v1/models`). The default
-`onde-kkk` is Kimi K3 (Moonshot AI). Other tiers backed by Chinese model makers are `onde-apex`,
-`onde-flux`, `onde-flare` (DeepSeek), `onde-nova`, `onde-orbit`, `onde-aura` (Z.ai GLM),
-`onde-zenith` (Qwen) and `onde-prism` (MiniMax). The Anthropic- and OpenAI-backed tiers
-(`onde-large`, `onde-balanced`, `onde-fast`, `onde-pro`, `onde-air`, `onde-mini`) are available
-too.
-
-**condense** gets the key as `X-Condense-Auth-Token` and the ACP session id as
-`X-Condense-Session-Id`. condense serves its own models on that key, so you don't need an upstream
-key. Gemini's per-tool-call `thought_signature` is kept and sent back with the history, which
-Gemini requires for multi-step tool use.
 
 ## Configuration
 
 | Env var | Default | |
 |---------|---------|---|
-| `ONDE_CODE_PROVIDER` | detected from keys | `onde`, `condense` or `openai` |
+| `ONDE_CODE_PROVIDER` | detected from keys | `onde`, or `openai` for any OpenAI API compatible endpoint |
 | `OPENAI_BASE_URL` | the provider's base URL | any OpenAI-compatible base URL |
 | `OPENAI_API_KEY` | the provider's key | sent as a Bearer token; overrides the provider key |
 | `OPENAI_MODEL` | the provider's model | must support tool calling |
@@ -164,15 +149,12 @@ Gemini requires for multi-step tool use.
 | `ONDE_CODE_YOLO` | unset | `1` or `true` approves every tool call |
 | `ONDE_CODE_COMMAND_TIMEOUT_SECS` | `120` | how long `run_command` may run before it is killed |
 | `ONDE_CODE_CONTEXT_WINDOW` | `128000` | context size reported in `usage_update` |
-| `ONDE_CODE_SURFACE` | `acp` | set to `tui` by the terminal UI; used in the commit trailer |
+| `ONDE_CODE_SURFACE` | `acp` | set to `tui` by the terminal UI |
 | `RUST_LOG` | unset | log filter; logs go to stderr, never stdout |
 
 ```
 onde-code [--acp] [--yolo] [--list-models] [--root <path>...] [--setup]
 ```
-
-When the agent makes a git commit, it adds
-`Co-Authored-By: OndeCode v<version>-<surface> <noreply@ondeinference.com>`.
 
 ## Development
 

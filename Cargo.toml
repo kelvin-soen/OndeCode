@@ -3,7 +3,7 @@ name = "onde-code"
 version = "1.0.0"
 edition = "2024"
 license = "Apache-2.0"
-description = "Small ACP coding agent backed by any OpenAI-compatible chat completions API"
+description = "Onde Code is Onde Inference's ACP-compatible coding agent for model fine-tuning and deployment."
 repository = "https://github.com/kelvin-soen/OndeCode"
 
 [dependencies]
