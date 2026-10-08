@@ -64,9 +64,10 @@ impl LlmConfig {
     /// Picks the provider from `ONDE_CODE_PROVIDER`, or else Onde Inference whenever
     /// `ONDE_API_KEY` is set, and a generic OpenAI API compatible endpoint otherwise.
     ///
-    /// Onde Inference always uses `ONDE_API_KEY` and its own base URL, so a stray
-    /// `OPENAI_API_KEY` or `OPENAI_BASE_URL` in the environment can't redirect it or send it
-    /// the wrong key. `OPENAI_MODEL` picks the model for either provider.
+    /// Onde Inference always uses `ONDE_API_KEY`, and its own base URL unless `ONDE_BASE_URL`
+    /// names another (a local or staging deployment), so a stray `OPENAI_API_KEY` or
+    /// `OPENAI_BASE_URL` in the environment can't redirect it or send it the wrong key.
+    /// `OPENAI_MODEL` picks the model for either provider.
     ///
     /// If none of the provider keys are present in the environment, fallback values are
     /// loaded from `config_dir()/env` (see [`config_dir`]).
@@ -91,7 +92,7 @@ impl LlmConfig {
             None => Provider::OpenAi,
         };
         let base_url = match provider {
-            Provider::Onde => None,
+            Provider::Onde => env("ONDE_BASE_URL"),
             Provider::OpenAi => env("OPENAI_BASE_URL"),
         };
         Self {
@@ -212,6 +213,21 @@ mod tests {
         assert_eq!(c.api_key.as_deref(), Some("app:secret"));
         assert_eq!(c.base_url, "https://cloud.ondeinference.com/v1");
         assert_eq!(c.model, "onde-prism");
+    }
+
+    #[test]
+    fn onde_base_url_points_onde_at_another_deployment() {
+        let c = config(&[
+            ("ONDE_API_KEY", "app:secret"),
+            ("ONDE_BASE_URL", "http://localhost:8090/v1/"),
+            ("OPENAI_BASE_URL", "http://elsewhere/v1"),
+        ]);
+        assert_eq!(c.provider, Provider::Onde);
+        assert_eq!(c.base_url, "http://localhost:8090/v1");
+        assert_eq!(c.api_key.as_deref(), Some("app:secret"));
+        // It only applies to Onde Inference.
+        let generic = config(&[("OPENAI_API_KEY", "sk"), ("ONDE_BASE_URL", "http://x/v1")]);
+        assert_eq!(generic.base_url, "https://api.openai.com/v1");
     }
 
     #[test]

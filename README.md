@@ -136,7 +136,8 @@ It also accepts any OpenAI API compatible endpoint. Point it there with `OPENAI_
 tool (function) calling.
 
 Onde Inference wins: whenever `ONDE_API_KEY` is set, the agent uses it with the Onde Inference
-URL and ignores `OPENAI_API_KEY` and `OPENAI_BASE_URL`. `OPENAI_MODEL` still picks the model.
+URL and ignores `OPENAI_API_KEY` and `OPENAI_BASE_URL`. `OPENAI_MODEL` still picks the model. To
+point it at a local or staging Onde Inference deployment, set `ONDE_BASE_URL`.
 To use another endpoint while `ONDE_API_KEY` is set, set `ONDE_CODE_PROVIDER=openai`.
 
 ```sh
@@ -151,6 +152,7 @@ onde-code --list-models     # what the configured endpoint serves
 |---------|---------|---|
 | `ONDE_CODE_PROVIDER` | detected from keys | `onde`, or `openai` for any OpenAI API compatible endpoint |
 | `ONDE_API_KEY` | unset | Onde Inference `app-id:app-secret`; selects Onde Inference |
+| `ONDE_BASE_URL` | `https://cloud.ondeinference.com/v1` | Onde Inference base URL, for a local or staging deployment |
 | `OPENAI_BASE_URL` | `https://api.openai.com/v1` | base URL of an OpenAI API compatible endpoint |
 | `OPENAI_API_KEY` | unset | bearer token for that endpoint |
 | `OPENAI_MODEL` | `onde-kkk` (Onde Inference), `gpt-4o-mini` (other endpoints) | model id; must support tool calling |
