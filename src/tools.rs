@@ -476,6 +476,9 @@ impl ToolCtx {
             ))
             .block_task();
         let timeout = command_timeout();
+        // Losing the race drops the pending wait_for_exit, and the SDK sends
+        // `$/cancel_request` for it (ACP v1 cascading cancellation) before we
+        // kill and release the terminal.
         let exit = tokio::select! {
             r = wait => Some(r?.exit_status),
             () = tokio::time::sleep(timeout) => None,
@@ -580,6 +583,8 @@ impl ToolCtx {
                 ),
             ],
         );
+        // On cancel the pending request is dropped, which makes the SDK send
+        // `$/cancel_request` so the client can close its permission prompt.
         let resp = tokio::select! {
             r = self.connection.send_request(req).block_task() => r?,
             () = self.cancel.cancelled() => return Ok(false),

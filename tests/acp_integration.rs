@@ -7,7 +7,7 @@
 //! the mock asserts it arrives on the `X-Condense-Auth-Token` header.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use agent_client_protocol::schema::ProtocolVersion;
@@ -229,6 +229,8 @@ struct Captured {
     diff_paths: Vec<PathBuf>,
     /// Tool calls seen as `session/update` ToolCall notifications: (title, locations).
     tool_call_details: Vec<(String, Vec<PathBuf>)>,
+    /// Permission requests the agent withdrew with `$/cancel_request`.
+    permission_cancel_requests: usize,
 }
 
 /// What the fake user does when asked for permission.
@@ -236,6 +238,9 @@ struct Captured {
 enum PermissionPolicy {
     AllowAlways,
     RejectOnce,
+    /// Leave the prompt open and send `session/cancel`, as a user hitting
+    /// stop while the permission dialog is up would.
+    CancelTurn,
 }
 
 /// Whether the fake client advertises the ACP v1 fs methods, and what its
@@ -293,6 +298,9 @@ enum TerminalPolicy {
 #[derive(Debug, Default)]
 struct TerminalCalls {
     events: Mutex<Vec<TerminalCallEvent>>,
+    /// Set when the agent withdrew a pending `terminal/wait_for_exit` with
+    /// `$/cancel_request`.
+    wait_cancelled: AtomicBool,
 }
 
 struct Harness {
@@ -406,7 +414,7 @@ impl Harness {
                 agent_client_protocol::on_receive_notification!(),
             )
             .on_receive_request(
-                async move |req: RequestPermissionRequest, responder, _cx| {
+                async move |req: RequestPermissionRequest, responder, cx| {
                     {
                         let mut c = captured.lock().unwrap();
                         c.permission_requests += 1;
@@ -421,6 +429,25 @@ impl Harness {
                     let wanted = match policy {
                         PermissionPolicy::AllowAlways => "allow_always",
                         PermissionPolicy::RejectOnce => "reject_once",
+                        PermissionPolicy::CancelTurn => {
+                            cx.send_notification(CancelNotification::new(req.session_id))?;
+                            let cancellation = responder.cancellation();
+                            let captured = captured.clone();
+                            return cx.spawn(async move {
+                                let withdrawn = tokio::time::timeout(
+                                    std::time::Duration::from_secs(10),
+                                    cancellation.cancelled(),
+                                )
+                                .await
+                                .is_ok();
+                                if withdrawn {
+                                    captured.lock().unwrap().permission_cancel_requests += 1;
+                                }
+                                responder.respond(RequestPermissionResponse::new(
+                                    RequestPermissionOutcome::Cancelled,
+                                ))
+                            });
+                        }
                     };
                     // Sanity: the agent must offer the expected choice.
                     let option = req
@@ -492,9 +519,19 @@ impl Harness {
                             .push(TerminalCallEvent::WaitForExit {
                                 terminal_id: req.terminal_id.0.to_string(),
                             });
+                        let cancellation = responder.cancellation();
+                        let terminal_calls = terminal_calls.clone();
                         cx.spawn(async move {
                             if term_hang_wait {
-                                tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+                                tokio::select! {
+                                    () = tokio::time::sleep(std::time::Duration::from_secs(3600)) => {}
+                                    () = cancellation.cancelled() => {
+                                        terminal_calls.wait_cancelled.store(true, Ordering::SeqCst);
+                                        return responder.respond_with_error(
+                                            agent_client_protocol::Error::request_cancelled(),
+                                        );
+                                    }
+                                }
                             }
                             responder.respond(WaitForTerminalExitResponse::new(
                                 TerminalExitStatus::new().exit_code(term_exit_code),
@@ -1444,6 +1481,48 @@ async fn acp_terminal_timeout_kills_before_output() {
     assert!(matches!(&events[2], TerminalCallEvent::Kill { .. }), "Kill must precede Output");
     assert!(matches!(&events[3], TerminalCallEvent::Output { .. }));
     assert!(matches!(&events[4], TerminalCallEvent::Release { .. }));
+    assert!(
+        harness.terminal_calls.wait_cancelled.load(Ordering::SeqCst),
+        "agent must send $/cancel_request for the abandoned terminal/wait_for_exit"
+    );
+
+    std::fs::remove_dir_all(&workdir).ok();
+}
+
+/// Cascading cancellation (ACP v1 cancellation page): when the turn is
+/// cancelled while a permission prompt is open, the agent must withdraw the
+/// pending `session/request_permission` with `$/cancel_request` so the client
+/// can dismiss its dialog, and the turn must end with `cancelled`.
+#[tokio::test]
+async fn acp_cancel_withdraws_pending_permission_request() {
+    let script = Script(vec![
+        Step::ToolCall {
+            name: "write_file",
+            arguments: json!({"path": "never.txt", "content": "x"}),
+        },
+        Step::Final("should never get here"),
+    ]);
+    let stats = Arc::new(MockStats::default());
+    let base_url = start_mock_llm(script, stats).await;
+    let workdir = temp_workdir();
+
+    let harness = Harness {
+        permission_policy: PermissionPolicy::CancelTurn,
+        ..Default::default()
+    };
+    let (stop, captured) = harness
+        .run_prompt(&base_url, &workdir, "Create never.txt")
+        .await;
+
+    assert_eq!(stop, StopReason::Cancelled);
+    let c = captured.lock().unwrap();
+    assert_eq!(c.permission_requests, 1);
+    assert_eq!(
+        c.permission_cancel_requests, 1,
+        "agent must send $/cancel_request for the open permission prompt"
+    );
+    drop(c);
+    assert!(!workdir.join("never.txt").exists());
 
     std::fs::remove_dir_all(&workdir).ok();
 }
