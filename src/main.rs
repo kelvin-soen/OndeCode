@@ -1372,17 +1372,23 @@ async fn run_agent(yolo_flag: bool) -> agent_client_protocol::Result<()> {
                     cx.spawn(async move {
                         // Remove every file the key may be loaded from, including the legacy
                         // macOS location, or the agent would still be logged in afterwards.
-                        for path in llm::config_file_candidates() {
-                            if let Err(e) = std::fs::remove_file(&path)
-                                && e.kind() != std::io::ErrorKind::NotFound
-                            {
-                                return responder.respond_with_error(
-                                    agent_client_protocol::Error::internal_error()
-                                        .data(format!("removing {}: {e}", path.display())),
-                                );
-                            }
-                        }
+                        // One failed removal doesn't stop the others.
+                        let failures: Vec<String> = llm::config_file_candidates()
+                            .into_iter()
+                            .filter_map(|path| match std::fs::remove_file(&path) {
+                                Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                                    Some(format!("removing {}: {e}", path.display()))
+                                }
+                                _ => None,
+                            })
+                            .collect();
                         agent.reload_llm().await;
+                        if !failures.is_empty() {
+                            return responder.respond_with_error(
+                                agent_client_protocol::Error::internal_error()
+                                    .data(failures.join("; ")),
+                            );
+                        }
                         responder.respond(LogoutResponse::new())
                     })
                 }
