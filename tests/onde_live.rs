@@ -18,8 +18,7 @@ fn onde_cmd() -> std::process::Command {
     cmd.env("ONDE_CODE_PROVIDER", "onde")
         .env_remove("OPENAI_BASE_URL")
         .env_remove("OPENAI_MODEL")
-        .env_remove("OPENAI_API_KEY")
-        .env_remove("CONDENSE_API_KEY");
+        .env_remove("OPENAI_API_KEY");
     cmd
 }
 

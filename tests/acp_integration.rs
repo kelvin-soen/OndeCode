@@ -3,8 +3,8 @@
 //! Each test spawns the real `onde-code` binary over stdio, drives it with the
 //! official SDK's `Client`, and points the agent at a mock OpenAI-compatible
 //! `/chat/completions` server that plays a scripted model. No real LLM or API
-//! key is needed — the provided debug key is passed as `CONDENSE_API_KEY` and
-//! the mock asserts it arrives on the `X-Condense-Auth-Token` header.
+//! key is needed: a dummy key is passed as `OPENAI_API_KEY` and the mock
+//! asserts it arrives as the bearer token.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -28,8 +28,8 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
-/// The debug key under test — forwarded to the agent as `CONDENSE_API_KEY`.
-const DEBUG_KEY: &str = "ck_api_d1dUxAzh82vcxPfN9rSDOeTIzxXL3vcCN7W1MYcU2TY";
+/// The dummy key under test, forwarded to the agent as `OPENAI_API_KEY`.
+const TEST_KEY: &str = "test-key";
 
 // ---------------------------------------------------------------------------
 // Mock OpenAI-compatible streaming endpoint
@@ -38,8 +38,7 @@ const DEBUG_KEY: &str = "ck_api_d1dUxAzh82vcxPfN9rSDOeTIzxXL3vcCN7W1MYcU2TY";
 #[derive(Debug, Default)]
 struct MockStats {
     requests: AtomicUsize,
-    saw_condense_key: Mutex<bool>,
-    saw_session_header: Mutex<bool>,
+    saw_bearer_key: Mutex<bool>,
 }
 
 /// What the scripted model should do on its next completion.
@@ -143,15 +142,10 @@ async fn start_mock_llm(script: Script, stats: Arc<MockStats>) -> String {
                 let (head, body) = read_http_request(&mut socket).await;
                 stats.requests.fetch_add(1, Ordering::SeqCst);
 
-                // Assert the condense debug key headers made it through.
+                // Assert the key made it through as the bearer token.
                 let lower = head.to_ascii_lowercase();
-                if lower
-                    .contains(&format!("x-condense-auth-token: {DEBUG_KEY}").to_ascii_lowercase())
-                {
-                    *stats.saw_condense_key.lock().unwrap() = true;
-                }
-                if lower.contains("x-condense-session-id:") {
-                    *stats.saw_session_header.lock().unwrap() = true;
+                if lower.contains(&format!("authorization: bearer {TEST_KEY}")) {
+                    *stats.saw_bearer_key.lock().unwrap() = true;
                 }
 
                 if head.starts_with("GET /v1/models") {
@@ -356,7 +350,9 @@ impl Harness {
             .env("OPENAI_BASE_URL", base_url)
             .env("OPENAI_MODEL", "scripted-test-model")
             .env("ONDE_CODE_MODELS", "scripted-test-model")
-            .env("CONDENSE_API_KEY", DEBUG_KEY);
+            .env("OPENAI_API_KEY", TEST_KEY)
+            // Use the mock even when the developer has ONDE_API_KEY set.
+            .env("ONDE_CODE_PROVIDER", "openai");
         if let Some(secs) = self.command_timeout_secs {
             cfg = cfg.env("ONDE_CODE_COMMAND_TIMEOUT_SECS", secs.to_string());
         }
@@ -735,15 +731,11 @@ async fn acp_full_agent_loop_with_tools() {
     let written = std::fs::read_to_string(workdir.join("hello.txt")).unwrap();
     assert_eq!(written, "hello from acp test");
 
-    // The mock endpoint saw the condense debug key on every request.
+    // The mock endpoint saw the key as the bearer token.
     assert!(stats.requests.load(Ordering::SeqCst) >= 5);
     assert!(
-        *stats.saw_condense_key.lock().unwrap(),
-        "X-Condense-Auth-Token header missing"
-    );
-    assert!(
-        *stats.saw_session_header.lock().unwrap(),
-        "X-Condense-Session-Id header missing"
+        *stats.saw_bearer_key.lock().unwrap(),
+        "Authorization: Bearer header missing"
     );
 
     std::fs::remove_dir_all(&workdir).ok();
@@ -1186,7 +1178,9 @@ async fn acp_mcp_stdio_tool_is_forwarded() {
         AcpAgentConfig::new(binary)
             .env("OPENAI_BASE_URL", &base_url)
             .env("OPENAI_MODEL", "scripted-test-model")
-            .env("CONDENSE_API_KEY", DEBUG_KEY),
+            .env("OPENAI_API_KEY", TEST_KEY)
+            // Use the mock even when the developer has ONDE_API_KEY set.
+            .env("ONDE_CODE_PROVIDER", "openai"),
     );
     let captured: Arc<Mutex<Captured>> = Arc::default();
     let captured_notify = captured.clone();
@@ -1309,7 +1303,9 @@ async fn acp_mcp_broken_server_does_not_fail_session() {
         AcpAgentConfig::new(binary)
             .env("OPENAI_BASE_URL", &base_url)
             .env("OPENAI_MODEL", "scripted-test-model")
-            .env("CONDENSE_API_KEY", DEBUG_KEY),
+            .env("OPENAI_API_KEY", TEST_KEY)
+            // Use the mock even when the developer has ONDE_API_KEY set.
+            .env("ONDE_CODE_PROVIDER", "openai"),
     );
     let captured: Arc<Mutex<Captured>> = Arc::default();
     let captured_notify = captured.clone();
