@@ -115,7 +115,6 @@ impl Agent {
             .env("HOME", home)
             .env("XDG_CONFIG_HOME", home.join(".config"))
             .env_remove("ONDE_API_KEY")
-            .env_remove("CONDENSE_API_KEY")
             .env_remove("OPENAI_API_KEY")
             .env_remove("OPENAI_BASE_URL")
             .env_remove("OPENAI_MODEL")

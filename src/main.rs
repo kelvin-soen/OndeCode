@@ -1,8 +1,9 @@
-//! onde-code: a small ACP coding agent backed by any OpenAI-compatible chat completions API.
+//! onde-code: Onde Inference's ACP-compatible coding agent.
 //!
 //! Run from a terminal it opens a TUI; launched by an editor (stdin not a TTY) or with `--acp`
-//! it speaks ACP over stdio. Configure with OPENAI_BASE_URL, OPENAI_API_KEY, OPENAI_MODEL or
-//! CONDENSE_API_KEY. Set ONDE_CODE_YOLO=1 to skip permission prompts. Logs go to stderr (RUST_LOG).
+//! it speaks ACP over stdio. Configure with ONDE_API_KEY for Onde Inference, or with
+//! OPENAI_BASE_URL, OPENAI_API_KEY and OPENAI_MODEL for any OpenAI API compatible endpoint.
+//! Set ONDE_CODE_YOLO=1 to skip permission prompts. Logs go to stderr (RUST_LOG).
 
 mod llm;
 mod mcp;
@@ -177,8 +178,8 @@ impl CoderAgent {
         let ids = {
             {
                 let default = llm.model().to_string();
-                // An explicit list wins: some endpoints (Condense) can't list models with an
-                // API key, and editors show this list as the model picker.
+                // An explicit list wins: some endpoints can't list models with an API key,
+                // and editors show this list as the model picker.
                 let configured: Vec<String> = std::env::var("ONDE_CODE_MODELS")
                     .unwrap_or_default()
                     .split(',')
@@ -358,10 +359,10 @@ impl CoderAgent {
                     .join("\n");
                 format!("Available models:\n\n{list}\n\nSwitch with the model picker.")
             }
-            Some("/setup") => "Run `onde-code --setup` in a terminal to choose a provider and \
-                store an API key, then sign in again from your editor. You can also set \
-                `OPENAI_BASE_URL`, `OPENAI_API_KEY` and `OPENAI_MODEL` (or `CONDENSE_API_KEY`) \
-                in the agent's environment."
+            Some("/setup") => "Run `onde-code --setup` in a terminal to store an Onde Inference \
+                key (or an OpenAI API compatible endpoint), then sign in again from your editor. \
+                You can also set `ONDE_API_KEY`, or `OPENAI_BASE_URL`, `OPENAI_API_KEY` and \
+                `OPENAI_MODEL`, in the agent's environment."
                 .to_string(),
             _ => return Ok(None),
         };
@@ -736,7 +737,7 @@ impl CoderAgent {
 
         for _ in 0..MAX_TURNS {
             let completion = tokio::select! {
-                r = llm.complete(&ctx.session_id.0, model, messages, &tool_defs, |delta| {
+                r = llm.complete(model, messages, &tool_defs, |delta| {
                     let update = match delta {
                         Delta::Text(t) => SessionUpdate::AgentMessageChunk(
                             ContentChunk::new(t.to_string().into()).message_id(message_id.clone()),
@@ -1074,17 +1075,35 @@ async fn setup() -> anyhow::Result<()> {
     };
 
     println!("onde-code setup\n");
-    println!("  1) Onde Cloud (ONDE_API_KEY, https://cloud.ondeinference.com)");
-    println!("  2) Condense   (CONDENSE_API_KEY, https://api.condense.chat)");
-    println!("  3) OpenAI     (OPENAI_API_KEY, https://api.openai.com)");
+    println!("  1) Onde Inference                    (ONDE_API_KEY)");
+    println!(
+        "  2) OpenAI API compatible endpoint    (OPENAI_BASE_URL, OPENAI_API_KEY, OPENAI_MODEL)"
+    );
     let (provider_var, key_var) = loop {
-        match prompt_line("\nChoose a provider [1-3]: ")?.as_str() {
+        match prompt_line("\nChoose a provider [1-2]: ")?.as_str() {
             "1" | "onde" => break ("onde", "ONDE_API_KEY"),
-            "2" | "condense" => break ("condense", "CONDENSE_API_KEY"),
-            "3" | "openai" => break ("openai", "OPENAI_API_KEY"),
-            _ => println!("Please enter 1, 2 or 3."),
+            "2" | "openai" => break ("openai", "OPENAI_API_KEY"),
+            _ => println!("Please enter 1 or 2."),
         }
     };
+    // A generic endpoint also needs its URL and a model that supports tool calling.
+    let mut endpoint: Vec<(&str, String)> = Vec::new();
+    if provider_var == "openai" {
+        for (var, label, default) in [
+            ("OPENAI_BASE_URL", "Base URL", "https://api.openai.com/v1"),
+            ("OPENAI_MODEL", "Model", "gpt-4o-mini"),
+        ] {
+            let value = prompt_line(&format!("{label} [{default}]: "))?;
+            endpoint.push((
+                var,
+                if value.is_empty() {
+                    default.to_string()
+                } else {
+                    value
+                },
+            ));
+        }
+    }
     if provider_var == "onde" {
         // Same auth as documented at https://ondeinference.com/cloud.
         println!("\nGet credentials: sign in at https://ondeinference.com/root/login,");
@@ -1107,6 +1126,8 @@ async fn setup() -> anyhow::Result<()> {
             Some(provider_var.to_string())
         } else if name == key_var {
             Some(key.clone())
+        } else if let Some((_, value)) = endpoint.iter().find(|(var, _)| *var == name) {
+            Some(value.clone())
         } else {
             std::env::var(name).ok()
         }
@@ -1122,7 +1143,10 @@ async fn setup() -> anyhow::Result<()> {
     let dir = llm::config_dir().context("no config directory available")?;
     std::fs::create_dir_all(&dir)?;
     let path = dir.join("env");
-    let content = format!("ONDE_CODE_PROVIDER={provider_var}\n{key_var}={key}\n");
+    let mut content = format!("ONDE_CODE_PROVIDER={provider_var}\n{key_var}={key}\n");
+    for (var, value) in &endpoint {
+        content.push_str(&format!("{var}={value}\n"));
+    }
     std::fs::write(&path, content)?;
     #[cfg(unix)]
     {

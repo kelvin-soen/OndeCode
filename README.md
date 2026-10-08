@@ -37,7 +37,7 @@ Once it lands, editors that read the registry can install onde-code without the 
 ## Quick start
 
 ```sh
-onde-code --setup        # pick a provider, paste a key; it is checked live, then stored
+onde-code --setup        # paste an Onde Inference key (or set up another endpoint); checked live, then stored
 cd my-project
 onde-code                # terminal UI
 ```
@@ -128,8 +128,12 @@ the Onde dashboard (or store it with `--setup`). The agent then talks to
 `onde-code --list-models` prints the ids your key can use.
 
 It also accepts any OpenAI API compatible endpoint. Point it there with `OPENAI_BASE_URL`,
-`OPENAI_API_KEY` and `OPENAI_MODEL`. The model has to support tool (function) calling. If
-`ONDE_API_KEY` is also in the environment, set `ONDE_CODE_PROVIDER=openai` as well.
+`OPENAI_API_KEY` and `OPENAI_MODEL`, or pick that option in `--setup`. The model has to support
+tool (function) calling.
+
+Onde Inference wins: whenever `ONDE_API_KEY` is set, the agent uses it with the Onde Inference
+URL and ignores `OPENAI_API_KEY` and `OPENAI_BASE_URL`. `OPENAI_MODEL` still picks the model.
+To use another endpoint while `ONDE_API_KEY` is set, set `ONDE_CODE_PROVIDER=openai`.
 
 ```sh
 ONDE_API_KEY=APP_ID:APP_SECRET onde-code
@@ -142,9 +146,10 @@ onde-code --list-models     # what the configured endpoint serves
 | Env var | Default | |
 |---------|---------|---|
 | `ONDE_CODE_PROVIDER` | detected from keys | `onde`, or `openai` for any OpenAI API compatible endpoint |
-| `OPENAI_BASE_URL` | the provider's base URL | any OpenAI-compatible base URL |
-| `OPENAI_API_KEY` | the provider's key | sent as a Bearer token; overrides the provider key |
-| `OPENAI_MODEL` | the provider's model | must support tool calling |
+| `ONDE_API_KEY` | unset | Onde Inference `app-id:app-secret`; selects Onde Inference |
+| `OPENAI_BASE_URL` | `https://api.openai.com/v1` | base URL of an OpenAI API compatible endpoint |
+| `OPENAI_API_KEY` | unset | bearer token for that endpoint |
+| `OPENAI_MODEL` | `onde-kkk` (Onde Inference), `gpt-4o-mini` (other endpoints) | model id; must support tool calling |
 | `ONDE_CODE_MODELS` | listed from `/models` | comma-separated models for the editor's model picker |
 | `ONDE_CODE_YOLO` | unset | `1` or `true` approves every tool call |
 | `ONDE_CODE_COMMAND_TIMEOUT_SECS` | `120` | how long `run_command` may run before it is killed |
