@@ -184,56 +184,6 @@ fn write_text_file_blocking(
     Ok(WriteTextFileResponse::new())
 }
 
-#[cfg(test)]
-mod fs_handler_tests {
-    use super::*;
-
-    #[test]
-    fn read_text_file_slices_by_1_based_line_and_limit() {
-        let dir = std::env::temp_dir().join("onde-code-tui-fs-test");
-        std::fs::create_dir_all(&dir).unwrap();
-        let file = dir.join("lines.txt");
-        std::fs::write(&file, "one\ntwo\nthree\nfour\n").unwrap();
-
-        let all = read_text_file_blocking(&file, None, None).unwrap();
-        assert_eq!(all.content, "one\ntwo\nthree\nfour");
-
-        let from_line = read_text_file_blocking(&file, Some(2), None).unwrap();
-        assert_eq!(from_line.content, "two\nthree\nfour");
-
-        let limited = read_text_file_blocking(&file, Some(2), Some(1)).unwrap();
-        assert_eq!(limited.content, "two");
-
-        let past_end = read_text_file_blocking(&file, Some(99), None).unwrap();
-        assert_eq!(past_end.content, "");
-
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn read_text_file_missing_is_resource_not_found() {
-        let err = read_text_file_blocking(Path::new("/definitely/does/not/exist.txt"), None, None)
-            .unwrap_err();
-        assert_eq!(err.code, agent_client_protocol::ErrorCode::ResourceNotFound);
-    }
-
-    #[test]
-    fn write_text_file_creates_missing_file_and_parents() {
-        let dir = std::env::temp_dir()
-            .join("onde-code-tui-fs-test-2")
-            .join("nested");
-        let file = dir.join("created.txt");
-        write_text_file_blocking(&file, "hello").unwrap();
-        assert_eq!(std::fs::read_to_string(&file).unwrap(), "hello");
-
-        // Overwrite existing.
-        write_text_file_blocking(&file, "again").unwrap();
-        assert_eq!(std::fs::read_to_string(&file).unwrap(), "again");
-
-        std::fs::remove_dir_all(dir.parent().unwrap()).ok();
-    }
-}
-
 enum Entry {
     User(String),
     Agent(String),
@@ -739,4 +689,54 @@ fn summarize(content: &[ToolCallContent]) -> String {
         .filter(|s| !s.is_empty())
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+#[cfg(test)]
+mod fs_handler_tests {
+    use super::*;
+
+    #[test]
+    fn read_text_file_slices_by_1_based_line_and_limit() {
+        let dir = std::env::temp_dir().join("onde-code-tui-fs-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("lines.txt");
+        std::fs::write(&file, "one\ntwo\nthree\nfour\n").unwrap();
+
+        let all = read_text_file_blocking(&file, None, None).unwrap();
+        assert_eq!(all.content, "one\ntwo\nthree\nfour");
+
+        let from_line = read_text_file_blocking(&file, Some(2), None).unwrap();
+        assert_eq!(from_line.content, "two\nthree\nfour");
+
+        let limited = read_text_file_blocking(&file, Some(2), Some(1)).unwrap();
+        assert_eq!(limited.content, "two");
+
+        let past_end = read_text_file_blocking(&file, Some(99), None).unwrap();
+        assert_eq!(past_end.content, "");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn read_text_file_missing_is_resource_not_found() {
+        let err = read_text_file_blocking(Path::new("/definitely/does/not/exist.txt"), None, None)
+            .unwrap_err();
+        assert_eq!(err.code, agent_client_protocol::ErrorCode::ResourceNotFound);
+    }
+
+    #[test]
+    fn write_text_file_creates_missing_file_and_parents() {
+        let dir = std::env::temp_dir()
+            .join("onde-code-tui-fs-test-2")
+            .join("nested");
+        let file = dir.join("created.txt");
+        write_text_file_blocking(&file, "hello").unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "hello");
+
+        // Overwrite existing.
+        write_text_file_blocking(&file, "again").unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "again");
+
+        std::fs::remove_dir_all(dir.parent().unwrap()).ok();
+    }
 }

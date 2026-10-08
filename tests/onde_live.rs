@@ -74,10 +74,10 @@ async fn onde_answers_prompt() {
         .builder()
         .on_receive_notification(
             async move |n: SessionNotification, _cx| {
-                if let SessionUpdate::AgentMessageChunk(chunk) = n.update {
-                    if let ContentBlock::Text(t) = chunk.content {
-                        text_notify.lock().unwrap().push_str(&t.text);
-                    }
+                if let SessionUpdate::AgentMessageChunk(chunk) = n.update
+                    && let ContentBlock::Text(t) = chunk.content
+                {
+                    text_notify.lock().unwrap().push_str(&t.text);
                 }
                 Ok(())
             },

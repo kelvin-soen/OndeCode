@@ -169,12 +169,11 @@ pub fn describe(
         .clone()
         .map(|p| {
             let mut location = ToolCallLocation::new(p);
-            if name == READ_FILE {
-                if let Some(line) = args.get("line").and_then(Value::as_u64) {
-                    if line >= 1 {
-                        location = location.line(line as u32);
-                    }
-                }
+            if name == READ_FILE
+                && let Some(line) = args.get("line").and_then(Value::as_u64)
+                && line >= 1
+            {
+                location = location.line(line as u32);
             }
             location
         })
@@ -266,10 +265,10 @@ impl ToolCtx {
             }
             // Allow any directory below a root (e.g. a crate dir like `root/crate/src`),
             // as long as it doesn't escape the root via `..`.
-            if let Ok(rest) = candidate.strip_prefix(&ws_root) {
-                if rest.components().all(|c| matches!(c, Component::Normal(_))) {
-                    return Ok(candidate);
-                }
+            if let Ok(rest) = candidate.strip_prefix(&ws_root)
+                && rest.components().all(|c| matches!(c, Component::Normal(_)))
+            {
+                return Ok(candidate);
             }
         }
         let known = self

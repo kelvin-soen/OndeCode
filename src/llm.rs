@@ -174,12 +174,11 @@ fn load_config_env_vars() -> std::collections::HashMap<String, String> {
         if let Some((k, v)) = line.split_once('=') {
             let k = k.trim().to_string();
             let mut v = v.trim();
-            if (v.starts_with('"') && v.ends_with('"'))
-                || (v.starts_with('\'') && v.ends_with('\''))
+            if ((v.starts_with('"') && v.ends_with('"'))
+                || (v.starts_with('\'') && v.ends_with('\'')))
+                && v.len() >= 2
             {
-                if v.len() >= 2 {
-                    v = &v[1..v.len() - 1];
-                }
+                v = &v[1..v.len() - 1];
             }
             vars.insert(k, v.to_string());
         }
@@ -557,16 +556,16 @@ impl LlmClient {
                 }
                 for choice in chunk.choices {
                     let d = choice.delta;
-                    if let Some(r) = d.reasoning_content.as_deref().or(d.reasoning.as_deref()) {
-                        if !r.is_empty() {
-                            on_delta(Delta::Reasoning(r));
-                        }
+                    if let Some(r) = d.reasoning_content.as_deref().or(d.reasoning.as_deref())
+                        && !r.is_empty()
+                    {
+                        on_delta(Delta::Reasoning(r));
                     }
-                    if let Some(t) = d.content.as_deref() {
-                        if !t.is_empty() {
-                            out.content.push_str(t);
-                            on_delta(Delta::Text(t));
-                        }
+                    if let Some(t) = d.content.as_deref()
+                        && !t.is_empty()
+                    {
+                        out.content.push_str(t);
+                        on_delta(Delta::Text(t));
                     }
                     for tc in d.tool_calls {
                         if out.tool_calls.len() <= tc.index {

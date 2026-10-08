@@ -6,7 +6,7 @@
 //! key is needed — the provided debug key is passed as `CONDENSE_API_KEY` and
 //! the mock asserts it arrives on the `X-Condense-Auth-Token` header.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -255,10 +255,13 @@ enum FsPolicy {
     Advertise { content: String },
 }
 
+/// An fs/read_text_file request as received: (path, line, limit).
+type FsRead = (PathBuf, Option<u32>, Option<u32>);
+
 /// Records what fs methods the fake client received, if any.
 #[derive(Debug, Default)]
 struct FsCalls {
-    reads: Mutex<Vec<(PathBuf, Option<u32>, Option<u32>)>>,
+    reads: Mutex<Vec<FsRead>>,
     writes: Mutex<Vec<(PathBuf, String)>>,
 }
 
@@ -331,7 +334,7 @@ impl Harness {
     async fn run_prompt(
         &self,
         base_url: &str,
-        script_workdir: &PathBuf,
+        script_workdir: &Path,
         prompt: &str,
     ) -> (StopReason, Arc<Mutex<Captured>>) {
         self.run_prompt_maybe_cancel(base_url, script_workdir, prompt, false)
@@ -341,7 +344,7 @@ impl Harness {
     async fn run_prompt_maybe_cancel(
         &self,
         base_url: &str,
-        workdir: &PathBuf,
+        workdir: &Path,
         prompt: &str,
         cancel_midway: bool,
     ) -> (StopReason, Arc<Mutex<Captured>>) {
@@ -377,7 +380,7 @@ impl Harness {
             } => (*exit_code, output.clone(), *hang_wait),
             TerminalPolicy::NotAdvertised => (None, String::new(), false),
         };
-        let workdir = workdir.clone();
+        let workdir = workdir.to_path_buf();
         let prompt = prompt.to_string();
 
         let stop_reason = Client
@@ -1308,10 +1311,10 @@ async fn acp_mcp_broken_server_does_not_fail_session() {
         .builder()
         .on_receive_notification(
             async move |n: SessionNotification, _cx| {
-                if let SessionUpdate::AgentMessageChunk(chunk) = n.update {
-                    if let ContentBlock::Text(t) = chunk.content {
-                        captured_notify.lock().unwrap().text.push_str(&t.text);
-                    }
+                if let SessionUpdate::AgentMessageChunk(chunk) = n.update
+                    && let ContentBlock::Text(t) = chunk.content
+                {
+                    captured_notify.lock().unwrap().text.push_str(&t.text);
                 }
                 Ok(())
             },
