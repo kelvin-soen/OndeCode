@@ -67,6 +67,13 @@ impl ToolOutcome {
     }
 }
 
+/// Names of the builtin tools, shared by the schemas, the dispatcher and the permission flow.
+pub const READ_FILE: &str = "read_file";
+pub const WRITE_FILE: &str = "write_file";
+pub const EDIT_FILE: &str = "edit_file";
+pub const LIST_DIRECTORY: &str = "list_directory";
+pub const RUN_COMMAND: &str = "run_command";
+
 pub fn definitions() -> Value {
     let f = |name: &str, desc: &str, params: Value| json!({ "type": "function", "function": { "name": name, "description": desc, "parameters": params } });
     let root_prop = || {
@@ -77,7 +84,7 @@ pub fn definitions() -> Value {
     };
     json!([
         f(
-            "read_file",
+            READ_FILE,
             "Read a text file. Paths may be relative to the working directory.",
             json!({
                 "type": "object",
@@ -91,7 +98,7 @@ pub fn definitions() -> Value {
             })
         ),
         f(
-            "write_file",
+            WRITE_FILE,
             "Create or overwrite a file with the given content.",
             json!({
                 "type": "object",
@@ -100,7 +107,7 @@ pub fn definitions() -> Value {
             })
         ),
         f(
-            "edit_file",
+            EDIT_FILE,
             "Replace an exact, unique occurrence of old_string with new_string in a file.",
             json!({
                 "type": "object",
@@ -114,7 +121,7 @@ pub fn definitions() -> Value {
             })
         ),
         f(
-            "list_directory",
+            LIST_DIRECTORY,
             "List entries of a directory (directories end with '/').",
             json!({
                 "type": "object",
@@ -122,7 +129,7 @@ pub fn definitions() -> Value {
             })
         ),
         f(
-            "run_command",
+            RUN_COMMAND,
             "Run a shell command (sh -c) in the working directory and return its output.",
             json!({
                 "type": "object",
@@ -152,7 +159,7 @@ pub fn describe(
         .clone()
         .map(|p| {
             let mut location = ToolCallLocation::new(p);
-            if name == "read_file" {
+            if name == READ_FILE {
                 if let Some(line) = args.get("line").and_then(Value::as_u64) {
                     if line >= 1 {
                         location = location.line(line as u32);
@@ -167,11 +174,11 @@ pub fn describe(
         .as_deref()
         .map_or_else(|| base.display().to_string(), |p| p.display().to_string());
     match name {
-        "read_file" => (format!("Read {shown}"), ToolKind::Read, loc),
-        "write_file" => (format!("Write {shown}"), ToolKind::Edit, loc),
-        "edit_file" => (format!("Edit {shown}"), ToolKind::Edit, loc),
-        "list_directory" => (format!("List {shown}"), ToolKind::Search, loc),
-        "run_command" => {
+        READ_FILE => (format!("Read {shown}"), ToolKind::Read, loc),
+        WRITE_FILE => (format!("Write {shown}"), ToolKind::Edit, loc),
+        EDIT_FILE => (format!("Edit {shown}"), ToolKind::Edit, loc),
+        LIST_DIRECTORY => (format!("List {shown}"), ToolKind::Search, loc),
+        RUN_COMMAND => {
             let cmd = args.get("command").and_then(Value::as_str).unwrap_or("");
             let where_ = if base == ctx.cwd {
                 String::new()
@@ -186,11 +193,11 @@ pub fn describe(
 
 pub async fn execute(ctx: &ToolCtx, tool_call_id: &str, name: &str, args: Value) -> ToolOutcome {
     let result = match name {
-        "read_file" => ctx.read_file(args).await,
-        "write_file" => ctx.write_file(tool_call_id, args).await,
-        "edit_file" => ctx.edit_file(tool_call_id, args).await,
-        "list_directory" => ctx.list_directory(args).await,
-        "run_command" => ctx.run_command(tool_call_id, args).await,
+        READ_FILE => ctx.read_file(args).await,
+        WRITE_FILE => ctx.write_file(tool_call_id, args).await,
+        EDIT_FILE => ctx.edit_file(tool_call_id, args).await,
+        LIST_DIRECTORY => ctx.list_directory(args).await,
+        RUN_COMMAND => ctx.run_command(tool_call_id, args).await,
         other => Err(anyhow!("unknown tool `{other}`")),
     };
     result.unwrap_or_else(|e| ToolOutcome::err(format!("Error: {e:#}")))
@@ -348,7 +355,7 @@ impl ToolCtx {
         let old = self.read_existing(&path).await?;
         // ACP v1: Diff.path must be an absolute file path.
         let diff = Diff::new(absolutize(&path), a.content.clone()).old_text(old);
-        self.apply_edit(id, "write_file", &path, &a.content, diff)
+        self.apply_edit(id, WRITE_FILE, &path, &a.content, diff)
             .await
     }
 
@@ -370,7 +377,7 @@ impl ToolCtx {
         let new = old.replacen(&a.old_string, &a.new_string, 1);
         // ACP v1: Diff.path must be an absolute file path.
         let diff = Diff::new(absolutize(&path), new.clone()).old_text(old);
-        self.apply_edit(id, "edit_file", &path, &new, diff).await
+        self.apply_edit(id, EDIT_FILE, &path, &new, diff).await
     }
 
     async fn apply_edit(
@@ -417,7 +424,7 @@ impl ToolCtx {
     async fn run_command(&self, id: &str, args: Value) -> Result<ToolOutcome> {
         let a: CommandArgs = serde_json::from_value(args)?;
         let base = self.base_for(a.root.as_deref())?;
-        if !self.permit(id, "run_command", vec![]).await? {
+        if !self.permit(id, RUN_COMMAND, vec![]).await? {
             return Ok(ToolOutcome::err("User rejected running this command."));
         }
         if self.caps.terminal {
