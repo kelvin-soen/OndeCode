@@ -27,10 +27,12 @@ fn text_reply() -> Vec<Value> {
 
 /// The SSE events of a single tool call.
 fn tool_call_reply(name: &str, arguments: Value) -> Vec<Value> {
-    vec![json!({"choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{
+    vec![
+        json!({"choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{
         "index":0,"id":"call_1","type":"function",
         "function":{"name":name,"arguments":arguments.to_string()}
-    }]},"finish_reason":"tool_calls"}]})]
+    }]},"finish_reason":"tool_calls"}]}),
+    ]
 }
 
 /// Mock endpoint that answers the n-th request with `replies[n]` (the last reply repeats).
@@ -129,7 +131,13 @@ impl Agent {
         let mut child = cmd.spawn().unwrap();
         let stdin = child.stdin.take().unwrap();
         let lines = BufReader::new(child.stdout.take().unwrap()).lines();
-        Self { child, stdin, lines, next_id: 1, updates: Vec::new() }
+        Self {
+            child,
+            stdin,
+            lines,
+            next_id: 1,
+            updates: Vec::new(),
+        }
     }
 
     /// Send a request and return its response (`result` or `error` object), recording
@@ -138,13 +146,17 @@ impl Agent {
         let id = self.next_id;
         self.next_id += 1;
         let msg = json!({"jsonrpc":"2.0","id":id,"method":method,"params":params});
-        self.stdin.write_all(format!("{msg}\n").as_bytes()).await.unwrap();
+        self.stdin
+            .write_all(format!("{msg}\n").as_bytes())
+            .await
+            .unwrap();
         loop {
-            let line = tokio::time::timeout(std::time::Duration::from_secs(20), self.lines.next_line())
-                .await
-                .expect("agent timed out")
-                .unwrap()
-                .expect("agent closed stdout");
+            let line =
+                tokio::time::timeout(std::time::Duration::from_secs(20), self.lines.next_line())
+                    .await
+                    .expect("agent timed out")
+                    .unwrap()
+                    .expect("agent closed stdout");
             let v: Value = serde_json::from_str(&line).unwrap();
             if v.get("id") == Some(&json!(id)) && v.get("method").is_none() {
                 return v;
@@ -213,13 +225,17 @@ async fn delete_is_idempotent_and_list_rejects_cursors() {
     let mut agent = Agent::spawn(&home, &as_refs(&env));
     agent.initialize(false).await;
 
-    let r = agent.call("session/new", json!({"cwd": home, "mcpServers": []})).await;
+    let r = agent
+        .call("session/new", json!({"cwd": home, "mcpServers": []}))
+        .await;
     let sid = r["result"]["sessionId"].as_str().unwrap().to_string();
     let r = agent.call("session/list", json!({})).await;
     assert_eq!(r["result"]["sessions"].as_array().unwrap().len(), 1);
 
     for _ in 0..2 {
-        let r = agent.call("session/delete", json!({"sessionId": sid})).await;
+        let r = agent
+            .call("session/delete", json!({"sessionId": sid}))
+            .await;
         assert!(r.get("error").is_none(), "{r}");
     }
     let r = agent.call("session/list", json!({})).await;
@@ -238,21 +254,31 @@ async fn authenticate_reloads_and_logout_removes_stored_key() {
     std::fs::create_dir_all(&cfg).unwrap();
     // Credentials come only from the stored file, as after `onde-code --setup`.
     let env_file = cfg.join("env");
-    std::fs::write(&env_file, "ONDE_CODE_PROVIDER=openai\nOPENAI_API_KEY=stored-key\n").unwrap();
+    std::fs::write(
+        &env_file,
+        "ONDE_CODE_PROVIDER=openai\nOPENAI_API_KEY=stored-key\n",
+    )
+    .unwrap();
 
     let mut agent = Agent::spawn(&home, &[("OPENAI_BASE_URL", "http://127.0.0.1:9/v1")]);
     agent.initialize(true).await;
 
-    let r = agent.call("authenticate", json!({"methodId": "nope"})).await;
+    let r = agent
+        .call("authenticate", json!({"methodId": "nope"}))
+        .await;
     assert_eq!(r["error"]["code"], -32602, "{r}");
-    let r = agent.call("authenticate", json!({"methodId": "terminal-setup"})).await;
+    let r = agent
+        .call("authenticate", json!({"methodId": "terminal-setup"}))
+        .await;
     assert!(r.get("error").is_none(), "{r}");
 
     let r = agent.call("logout", json!({})).await;
     assert!(r.get("error").is_none(), "{r}");
     assert!(!env_file.exists(), "logout should remove the stored key");
 
-    let r = agent.call("session/new", json!({"cwd": home, "mcpServers": []})).await;
+    let r = agent
+        .call("session/new", json!({"cwd": home, "mcpServers": []}))
+        .await;
     assert_eq!(r["error"]["code"], -32000, "expected auth_required: {r}");
 
     std::fs::remove_dir_all(&home).ok();
@@ -270,7 +296,9 @@ async fn prompt_resolves_file_links_and_reports_ids_and_usage() {
     let env = llm_env(&base_url);
     let mut agent = Agent::spawn(&home, &as_refs(&env));
     agent.initialize(false).await;
-    let r = agent.call("session/new", json!({"cwd": home, "mcpServers": []})).await;
+    let r = agent
+        .call("session/new", json!({"cwd": home, "mcpServers": []}))
+        .await;
     let sid = r["result"]["sessionId"].as_str().unwrap().to_string();
 
     let r = agent
@@ -285,7 +313,10 @@ async fn prompt_resolves_file_links_and_reports_ids_and_usage() {
     assert_eq!(r["result"]["stopReason"], "end_turn", "{r}");
 
     let sent = bodies.lock().unwrap()[0].to_string();
-    assert!(sent.contains("secret-marker-7731"), "file content not inlined: {sent}");
+    assert!(
+        sent.contains("secret-marker-7731"),
+        "file content not inlined: {sent}"
+    );
     assert!(sent.contains("include_usage"), "{sent}");
 
     let chunks: Vec<&Value> = agent
@@ -296,7 +327,10 @@ async fn prompt_resolves_file_links_and_reports_ids_and_usage() {
         .collect();
     assert_eq!(chunks.len(), 2);
     let id = chunks[0]["messageId"].as_str().expect("messageId on chunk");
-    assert!(chunks.iter().all(|c| c["messageId"] == id), "chunks of one message share an id");
+    assert!(
+        chunks.iter().all(|c| c["messageId"] == id),
+        "chunks of one message share an id"
+    );
 
     let usage = agent
         .updates
@@ -319,29 +353,57 @@ async fn session_lifecycle_rejects_relative_paths() {
     agent.initialize(false).await;
 
     // Relative cwd is rejected on session/new
-    let r = agent.call("session/new", json!({"cwd": "relative/path", "mcpServers": []})).await;
+    let r = agent
+        .call(
+            "session/new",
+            json!({"cwd": "relative/path", "mcpServers": []}),
+        )
+        .await;
     assert_eq!(r["error"]["code"], -32602, "expected invalid_params: {r}");
-    assert!(r["error"]["message"].as_str().unwrap().to_lowercase().contains("invalid"));
+    assert!(
+        r["error"]["message"]
+            .as_str()
+            .unwrap()
+            .to_lowercase()
+            .contains("invalid")
+    );
 
     // Relative additional directory is rejected on session/new
-    let r = agent.call("session/new", json!({
-        "cwd": home,
-        "additionalDirectories": ["relative/root"],
-        "mcpServers": []
-    })).await;
+    let r = agent
+        .call(
+            "session/new",
+            json!({
+                "cwd": home,
+                "additionalDirectories": ["relative/root"],
+                "mcpServers": []
+            }),
+        )
+        .await;
     assert_eq!(r["error"]["code"], -32602, "expected invalid_params: {r}");
 
     // Valid absolute path succeeds
-    let r = agent.call("session/new", json!({"cwd": home, "mcpServers": []})).await;
+    let r = agent
+        .call("session/new", json!({"cwd": home, "mcpServers": []}))
+        .await;
     assert!(r.get("result").is_some(), "{r}");
     let sid = r["result"]["sessionId"].as_str().unwrap().to_string();
 
     // Relative cwd is rejected on session/resume
-    let r = agent.call("session/resume", json!({"sessionId": sid, "cwd": "relative/path"})).await;
+    let r = agent
+        .call(
+            "session/resume",
+            json!({"sessionId": sid, "cwd": "relative/path"}),
+        )
+        .await;
     assert_eq!(r["error"]["code"], -32602, "expected invalid_params: {r}");
 
     // Relative cwd is rejected on session/load
-    let r = agent.call("session/load", json!({"sessionId": sid, "cwd": "relative/path"})).await;
+    let r = agent
+        .call(
+            "session/load",
+            json!({"sessionId": sid, "cwd": "relative/path"}),
+        )
+        .await;
     assert_eq!(r["error"]["code"], -32602, "expected invalid_params: {r}");
 
     std::fs::remove_dir_all(&home).ok();
@@ -360,9 +422,14 @@ async fn auto_approve_is_a_boolean_option_only_for_capable_clients() {
     // Without `session.configOptions.boolean` the option is neither offered nor settable.
     let mut agent = Agent::spawn(&home, &as_refs(&env));
     agent.initialize(false).await;
-    let r = agent.call("session/new", json!({"cwd": home, "mcpServers": []})).await;
+    let r = agent
+        .call("session/new", json!({"cwd": home, "mcpServers": []}))
+        .await;
     let sid = r["result"]["sessionId"].as_str().unwrap().to_string();
-    assert!(option(&r["result"]["configOptions"], "auto_approve").is_none(), "{r}");
+    assert!(
+        option(&r["result"]["configOptions"], "auto_approve").is_none(),
+        "{r}"
+    );
     let r = agent
         .call(
             "session/set_config_option",
@@ -378,7 +445,9 @@ async fn auto_approve_is_a_boolean_option_only_for_capable_clients() {
             json!({"protocolVersion":1,"clientCapabilities":{"session":{"configOptions":{"boolean":{}}}}}),
         )
         .await;
-    let r = agent.call("session/new", json!({"cwd": home, "mcpServers": []})).await;
+    let r = agent
+        .call("session/new", json!({"cwd": home, "mcpServers": []}))
+        .await;
     let sid = r["result"]["sessionId"].as_str().unwrap().to_string();
     let opt = option(&r["result"]["configOptions"], "auto_approve").expect("offered");
     assert_eq!(opt["type"], "boolean");
@@ -407,7 +476,10 @@ async fn auto_approve_is_a_boolean_option_only_for_capable_clients() {
         .map(|u| &u["update"])
         .find(|u| u["sessionUpdate"] == "config_option_update")
         .expect("config_option_update sent");
-    assert_eq!(option(&update["configOptions"], "auto_approve").unwrap()["currentValue"], true);
+    assert_eq!(
+        option(&update["configOptions"], "auto_approve").unwrap()["currentValue"],
+        true
+    );
 
     std::fs::remove_dir_all(&home).ok();
 }
@@ -419,7 +491,10 @@ async fn auto_approve_skips_permission_requests() {
     let base_url = start_scripted_llm(
         bodies,
         vec![
-            tool_call_reply("write_file", json!({"path": "out.txt", "content": "approved"})),
+            tool_call_reply(
+                "write_file",
+                json!({"path": "out.txt", "content": "approved"}),
+            ),
             text_reply(),
         ],
     )
@@ -432,7 +507,9 @@ async fn auto_approve_skips_permission_requests() {
             json!({"protocolVersion":1,"clientCapabilities":{"session":{"configOptions":{"boolean":{}}}}}),
         )
         .await;
-    let r = agent.call("session/new", json!({"cwd": home, "mcpServers": []})).await;
+    let r = agent
+        .call("session/new", json!({"cwd": home, "mcpServers": []}))
+        .await;
     let sid = r["result"]["sessionId"].as_str().unwrap().to_string();
     agent
         .call(
@@ -449,7 +526,10 @@ async fn auto_approve_skips_permission_requests() {
         )
         .await;
     assert_eq!(r["result"]["stopReason"], "end_turn", "{r}");
-    assert_eq!(std::fs::read_to_string(home.join("out.txt")).unwrap(), "approved");
+    assert_eq!(
+        std::fs::read_to_string(home.join("out.txt")).unwrap(),
+        "approved"
+    );
 
     std::fs::remove_dir_all(&home).ok();
 }
@@ -462,10 +542,15 @@ async fn slash_commands_are_advertised_and_answered_locally() {
     let env = llm_env(&base_url);
     let mut agent = Agent::spawn(&home, &as_refs(&env));
     agent.initialize(false).await;
-    let r = agent.call("session/new", json!({"cwd": home, "mcpServers": []})).await;
+    let r = agent
+        .call("session/new", json!({"cwd": home, "mcpServers": []}))
+        .await;
     let sid = r["result"]["sessionId"].as_str().unwrap().to_string();
 
-    for (command, expect) in [("/models", "`mock-model` (current)"), ("/setup", "onde-code --setup")] {
+    for (command, expect) in [
+        ("/models", "`mock-model` (current)"),
+        ("/setup", "onde-code --setup"),
+    ] {
         let r = agent
             .call(
                 "session/prompt",
@@ -480,9 +565,15 @@ async fn slash_commands_are_advertised_and_answered_locally() {
             .map(|u| &u["update"])
             .find(|u| u["sessionUpdate"] == "agent_message_chunk")
             .expect("reply chunk");
-        assert!(reply["content"]["text"].as_str().unwrap().contains(expect), "{reply}");
+        assert!(
+            reply["content"]["text"].as_str().unwrap().contains(expect),
+            "{reply}"
+        );
     }
-    assert!(bodies.lock().unwrap().is_empty(), "commands must not reach the model");
+    assert!(
+        bodies.lock().unwrap().is_empty(),
+        "commands must not reach the model"
+    );
 
     // The notification follows the session/new response, so it is recorded by now.
     let commands = agent

@@ -6,7 +6,7 @@
 //! key is needed — the provided debug key is passed as `CONDENSE_API_KEY` and
 //! the mock asserts it arrives on the `X-Condense-Auth-Token` header.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -229,6 +229,8 @@ struct Captured {
     diff_paths: Vec<PathBuf>,
     /// Tool calls seen as `session/update` ToolCall notifications: (title, locations).
     tool_call_details: Vec<(String, Vec<PathBuf>)>,
+    /// `ToolCall.name` of each tool call, in order.
+    tool_names: Vec<Option<String>>,
     /// Permission requests the agent withdrew with `$/cancel_request`.
     permission_cancel_requests: usize,
 }
@@ -255,10 +257,13 @@ enum FsPolicy {
     Advertise { content: String },
 }
 
+/// An fs/read_text_file request as received: (path, line, limit).
+type FsRead = (PathBuf, Option<u32>, Option<u32>);
+
 /// Records what fs methods the fake client received, if any.
 #[derive(Debug, Default)]
 struct FsCalls {
-    reads: Mutex<Vec<(PathBuf, Option<u32>, Option<u32>)>>,
+    reads: Mutex<Vec<FsRead>>,
     writes: Mutex<Vec<(PathBuf, String)>>,
 }
 
@@ -331,7 +336,7 @@ impl Harness {
     async fn run_prompt(
         &self,
         base_url: &str,
-        script_workdir: &PathBuf,
+        script_workdir: &Path,
         prompt: &str,
     ) -> (StopReason, Arc<Mutex<Captured>>) {
         self.run_prompt_maybe_cancel(base_url, script_workdir, prompt, false)
@@ -341,7 +346,7 @@ impl Harness {
     async fn run_prompt_maybe_cancel(
         &self,
         base_url: &str,
-        workdir: &PathBuf,
+        workdir: &Path,
         prompt: &str,
         cancel_midway: bool,
     ) -> (StopReason, Arc<Mutex<Captured>>) {
@@ -377,7 +382,7 @@ impl Harness {
             } => (*exit_code, output.clone(), *hang_wait),
             TerminalPolicy::NotAdvertised => (None, String::new(), false),
         };
-        let workdir = workdir.clone();
+        let workdir = workdir.to_path_buf();
         let prompt = prompt.to_string();
 
         let stop_reason = Client
@@ -393,6 +398,7 @@ impl Harness {
                         }
                         SessionUpdate::ToolCall(tc) => {
                             c.tool_calls.push((tc.title.clone(), tc.status));
+                            c.tool_names.push(tc.name.clone());
                             c.tool_call_details.push((
                                 tc.title.clone(),
                                 tc.locations
@@ -697,6 +703,11 @@ async fn acp_full_agent_loop_with_tools() {
         c.text.contains("Done: created hello.txt"),
         "streamed text missing: {}",
         c.text
+    );
+    // ToolCall.name carries the programmatic tool name next to the human title.
+    assert_eq!(
+        c.tool_names,
+        ["list_directory", "write_file", "read_file", "run_command"].map(|n| Some(n.to_string()))
     );
     // 4 tool calls started; the 2 writes asked for permission (reads/list don't).
     assert_eq!(
@@ -1308,10 +1319,10 @@ async fn acp_mcp_broken_server_does_not_fail_session() {
         .builder()
         .on_receive_notification(
             async move |n: SessionNotification, _cx| {
-                if let SessionUpdate::AgentMessageChunk(chunk) = n.update {
-                    if let ContentBlock::Text(t) = chunk.content {
-                        captured_notify.lock().unwrap().text.push_str(&t.text);
-                    }
+                if let SessionUpdate::AgentMessageChunk(chunk) = n.update
+                    && let ContentBlock::Text(t) = chunk.content
+                {
+                    captured_notify.lock().unwrap().text.push_str(&t.text);
                 }
                 Ok(())
             },
@@ -1407,7 +1418,11 @@ async fn acp_terminal_lifecycle_happy_path() {
             assert_eq!(command, "sh");
             assert_eq!(args, &["-c".to_string(), "echo test_output".to_string()]);
             let cwd = cwd.as_ref().expect("cwd must be set");
-            assert!(cwd.is_absolute(), "terminal create cwd must be absolute: {}", cwd.display());
+            assert!(
+                cwd.is_absolute(),
+                "terminal create cwd must be absolute: {}",
+                cwd.display()
+            );
             assert_eq!(cwd, &workdir.canonicalize().unwrap());
         }
         other => panic!("expected Create event first, got {:?}", other),
@@ -1478,7 +1493,10 @@ async fn acp_terminal_timeout_kills_before_output() {
 
     assert!(matches!(&events[0], TerminalCallEvent::Create { .. }));
     assert!(matches!(&events[1], TerminalCallEvent::WaitForExit { .. }));
-    assert!(matches!(&events[2], TerminalCallEvent::Kill { .. }), "Kill must precede Output");
+    assert!(
+        matches!(&events[2], TerminalCallEvent::Kill { .. }),
+        "Kill must precede Output"
+    );
     assert!(matches!(&events[3], TerminalCallEvent::Output { .. }));
     assert!(matches!(&events[4], TerminalCallEvent::Release { .. }));
     assert!(

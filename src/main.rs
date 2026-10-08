@@ -19,20 +19,20 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use agent_client_protocol::schema::v1::{
     AgentAuthCapabilities, AgentCapabilities, AuthMethod, AuthMethodTerminal, AuthenticateRequest,
-    AuthenticateResponse, AvailableCommand, AvailableCommandsUpdate, ConfigOptionUpdate,
-    DeleteSessionRequest, DeleteSessionResponse, EmbeddedResource,
-    LogoutCapabilities, LogoutRequest, LogoutResponse, MessageId, SessionDeleteCapabilities,
-    ReadTextFileRequest, TextResourceContents, UsageUpdate, CancelNotification, ClientCapabilities,
-    CloseSessionRequest, CloseSessionResponse, ContentBlock, ContentChunk,
+    AuthenticateResponse, AvailableCommand, AvailableCommandsUpdate, CancelNotification,
+    ClientCapabilities, CloseSessionRequest, CloseSessionResponse, ConfigOptionUpdate,
+    ContentBlock, ContentChunk, DeleteSessionRequest, DeleteSessionResponse, EmbeddedResource,
     EmbeddedResourceResource, Implementation, InitializeRequest, InitializeResponse,
-    ListSessionsRequest, ListSessionsResponse, LoadSessionRequest, LoadSessionResponse, McpServer,
-    NewSessionRequest, NewSessionResponse, PromptCapabilities, PromptRequest, PromptResponse,
+    ListSessionsRequest, ListSessionsResponse, LoadSessionRequest, LoadSessionResponse,
+    LogoutCapabilities, LogoutRequest, LogoutResponse, McpServer, MessageId, NewSessionRequest,
+    NewSessionResponse, PromptCapabilities, PromptRequest, PromptResponse, ReadTextFileRequest,
     ResumeSessionRequest, ResumeSessionResponse, SessionAdditionalDirectoriesCapabilities,
     SessionCapabilities, SessionCloseCapabilities, SessionConfigOption,
-    SessionConfigOptionCategory, SessionConfigSelectOption, SessionConfigSelectOptions, SessionId,
-    SessionInfo, SessionListCapabilities, SessionNotification, SessionResumeCapabilities,
-    SessionUpdate, SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, StopReason,
-    ToolCall, ToolCallStatus, ToolCallUpdateFields,
+    SessionConfigOptionCategory, SessionConfigSelectOption, SessionConfigSelectOptions,
+    SessionDeleteCapabilities, SessionId, SessionInfo, SessionListCapabilities,
+    SessionNotification, SessionResumeCapabilities, SessionUpdate, SetSessionConfigOptionRequest,
+    SetSessionConfigOptionResponse, StopReason, TextResourceContents, ToolCall, ToolCallStatus,
+    ToolCallUpdateFields, UsageUpdate,
 };
 use agent_client_protocol::{Agent, Client, ConnectionTo, Responder, Stdio};
 use anyhow::Context;
@@ -382,8 +382,9 @@ impl CoderAgent {
         mcp_servers: Vec<McpServer>,
     ) -> agent_client_protocol::Result<NewSessionResponse> {
         if !cwd.is_absolute() {
-            return Err(agent_client_protocol::Error::invalid_params()
-                .data("cwd must be an absolute path"));
+            return Err(
+                agent_client_protocol::Error::invalid_params().data("cwd must be an absolute path")
+            );
         }
         if roots.iter().any(|r| !r.is_absolute()) {
             return Err(agent_client_protocol::Error::invalid_params()
@@ -470,8 +471,9 @@ impl CoderAgent {
     ) -> agent_client_protocol::Result<LoadSessionResponse> {
         let session_id = req.session_id.clone();
         if !req.cwd.is_absolute() {
-            return Err(agent_client_protocol::Error::invalid_params()
-                .data("cwd must be an absolute path"));
+            return Err(
+                agent_client_protocol::Error::invalid_params().data("cwd must be an absolute path")
+            );
         }
         if req.additional_directories.iter().any(|r| !r.is_absolute()) {
             return Err(agent_client_protocol::Error::invalid_params()
@@ -528,8 +530,7 @@ impl CoderAgent {
                             let name = tc
                                 .pointer("/function/name")
                                 .and_then(|v| v.as_str())
-                                .unwrap_or("unknown")
-                                .to_string();
+                                .map(str::to_string);
                             let args_str = tc
                                 .pointer("/function/arguments")
                                 .and_then(|v| v.as_str())
@@ -538,7 +539,8 @@ impl CoderAgent {
                             let args: Value =
                                 serde_json::from_str(&args_str).unwrap_or_else(|_| json!({}));
                             notify(SessionUpdate::ToolCall(
-                                ToolCall::new(id, name.clone())
+                                ToolCall::new(id, name.as_deref().unwrap_or("unknown"))
+                                    .name(name)
                                     .status(ToolCallStatus::Completed)
                                     .raw_input(args),
                             ))?;
@@ -568,8 +570,9 @@ impl CoderAgent {
     ) -> agent_client_protocol::Result<ResumeSessionResponse> {
         let session_id = req.session_id.clone();
         if !req.cwd.is_absolute() {
-            return Err(agent_client_protocol::Error::invalid_params()
-                .data("cwd must be an absolute path"));
+            return Err(
+                agent_client_protocol::Error::invalid_params().data("cwd must be an absolute path")
+            );
         }
         if req.additional_directories.iter().any(|r| !r.is_absolute()) {
             return Err(agent_client_protocol::Error::invalid_params()
@@ -754,7 +757,9 @@ impl CoderAgent {
             if let Some(usage) = completion.usage {
                 // `size` is the model's context window, which OpenAI-style endpoints don't
                 // report; take it from ONDE_CODE_CONTEXT_WINDOW, defaulting to 128k.
-                let used = usage.total_tokens.max(usage.prompt_tokens + usage.completion_tokens);
+                let used = usage
+                    .total_tokens
+                    .max(usage.prompt_tokens + usage.completion_tokens);
                 let size = std::env::var("ONDE_CODE_CONTEXT_WINDOW")
                     .ok()
                     .and_then(|v| v.parse().ok())
@@ -785,6 +790,7 @@ impl CoderAgent {
                 };
                 notify(SessionUpdate::ToolCall(
                     ToolCall::new(tc.id.clone(), title)
+                        .name(tc.name.clone())
                         .kind(kind)
                         .status(ToolCallStatus::InProgress)
                         .locations(locations)
@@ -880,7 +886,9 @@ async fn resolve_resource_links(
                     .map(|r| r.content)
                     .map_err(|e| e.to_string())
             } else {
-                tokio::fs::read_to_string(&path).await.map_err(|e| e.to_string())
+                tokio::fs::read_to_string(&path)
+                    .await
+                    .map_err(|e| e.to_string())
             };
             match text {
                 Ok(text) if text.len() <= MAX_LINKED_FILE_BYTES => {
@@ -936,19 +944,17 @@ fn prompt_to_text(blocks: &[ContentBlock]) -> String {
         match block {
             ContentBlock::Text(t) => parts.push(t.text.clone()),
             ContentBlock::ResourceLink(link) => parts.push(format!("[Referenced: {}]", link.uri)),
-            ContentBlock::Resource(res) => {
-                match &res.resource {
-                    EmbeddedResourceResource::TextResourceContents(r) => {
-                        parts.push(format!("<file uri=\"{}\">\n{}\n</file>", r.uri, r.text));
-                    }
-                    EmbeddedResourceResource::BlobResourceContents(b) => parts.push(format!(
-                        "[Attached binary resource: {} ({})]",
-                        b.uri,
-                        b.mime_type.as_deref().unwrap_or("unknown type")
-                    )),
-                    _ => {}
+            ContentBlock::Resource(res) => match &res.resource {
+                EmbeddedResourceResource::TextResourceContents(r) => {
+                    parts.push(format!("<file uri=\"{}\">\n{}\n</file>", r.uri, r.text));
                 }
-            }
+                EmbeddedResourceResource::BlobResourceContents(b) => parts.push(format!(
+                    "[Attached binary resource: {} ({})]",
+                    b.uri,
+                    b.mime_type.as_deref().unwrap_or("unknown type")
+                )),
+                _ => {}
+            },
             _ => {}
         }
     }
@@ -1244,11 +1250,10 @@ async fn run_agent(yolo_flag: bool) -> agent_client_protocol::Result<()> {
         .on_receive_request(
             {
                 let agent = agent.clone();
-                async move |req: ListSessionsRequest, responder, _cx| {
-                    match agent.list_sessions(req) {
-                        Ok(r) => responder.respond(r),
-                        Err(e) => responder.respond_with_error(e),
-                    }
+                async move |req: ListSessionsRequest, responder, _cx| match agent.list_sessions(req)
+                {
+                    Ok(r) => responder.respond(r),
+                    Err(e) => responder.respond_with_error(e),
                 }
             },
             agent_client_protocol::on_receive_request!(),
@@ -1366,16 +1371,25 @@ async fn run_agent(yolo_flag: bool) -> agent_client_protocol::Result<()> {
                 async move |_req: LogoutRequest, responder, cx| {
                     let agent = agent.clone();
                     cx.spawn(async move {
-                        if let Some(path) = llm::config_dir().map(|d| d.join("env"))
-                            && let Err(e) = std::fs::remove_file(&path)
-                            && e.kind() != std::io::ErrorKind::NotFound
-                        {
+                        // Remove every file the key may be loaded from, including the legacy
+                        // macOS location, or the agent would still be logged in afterwards.
+                        // One failed removal doesn't stop the others.
+                        let failures: Vec<String> = llm::config_file_candidates()
+                            .into_iter()
+                            .filter_map(|path| match std::fs::remove_file(&path) {
+                                Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                                    Some(format!("removing {}: {e}", path.display()))
+                                }
+                                _ => None,
+                            })
+                            .collect();
+                        agent.reload_llm().await;
+                        if !failures.is_empty() {
                             return responder.respond_with_error(
                                 agent_client_protocol::Error::internal_error()
-                                    .data(format!("removing {}: {e}", path.display())),
+                                    .data(failures.join("; ")),
                             );
                         }
-                        agent.reload_llm().await;
                         responder.respond(LogoutResponse::new())
                     })
                 }
