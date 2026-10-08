@@ -558,7 +558,9 @@ impl ToolCtx {
         if self.always_rejected.lock().unwrap().contains(tool) {
             return Ok(false);
         }
-        if self.auto_approve.load(Ordering::Relaxed) || self.always_allowed.lock().unwrap().contains(tool) {
+        if self.auto_approve.load(Ordering::Relaxed)
+            || self.always_allowed.lock().unwrap().contains(tool)
+        {
             return Ok(true);
         }
         let mut fields = ToolCallUpdateFields::new();
@@ -597,7 +599,10 @@ impl ToolCtx {
                 }
                 "allow_once" => true,
                 "reject_always" => {
-                    self.always_rejected.lock().unwrap().insert(tool.to_string());
+                    self.always_rejected
+                        .lock()
+                        .unwrap()
+                        .insert(tool.to_string());
                     false
                 }
                 _ => false,

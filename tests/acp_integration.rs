@@ -1407,7 +1407,11 @@ async fn acp_terminal_lifecycle_happy_path() {
             assert_eq!(command, "sh");
             assert_eq!(args, &["-c".to_string(), "echo test_output".to_string()]);
             let cwd = cwd.as_ref().expect("cwd must be set");
-            assert!(cwd.is_absolute(), "terminal create cwd must be absolute: {}", cwd.display());
+            assert!(
+                cwd.is_absolute(),
+                "terminal create cwd must be absolute: {}",
+                cwd.display()
+            );
             assert_eq!(cwd, &workdir.canonicalize().unwrap());
         }
         other => panic!("expected Create event first, got {:?}", other),
@@ -1478,7 +1482,10 @@ async fn acp_terminal_timeout_kills_before_output() {
 
     assert!(matches!(&events[0], TerminalCallEvent::Create { .. }));
     assert!(matches!(&events[1], TerminalCallEvent::WaitForExit { .. }));
-    assert!(matches!(&events[2], TerminalCallEvent::Kill { .. }), "Kill must precede Output");
+    assert!(
+        matches!(&events[2], TerminalCallEvent::Kill { .. }),
+        "Kill must precede Output"
+    );
     assert!(matches!(&events[3], TerminalCallEvent::Output { .. }));
     assert!(matches!(&events[4], TerminalCallEvent::Release { .. }));
     assert!(
