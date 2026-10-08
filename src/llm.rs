@@ -127,7 +127,7 @@ pub fn config_dir() -> Option<std::path::PathBuf> {
 
 /// Where to look for the stored `env` file, most preferred first: the platform config dir,
 /// then the legacy `~/.config/ondecode/env` used on macOS before platform dirs were adopted.
-fn config_file_candidates() -> Vec<std::path::PathBuf> {
+pub fn config_file_candidates() -> Vec<std::path::PathBuf> {
     let mut paths: Vec<std::path::PathBuf> =
         config_dir().into_iter().map(|d| d.join("env")).collect();
     #[cfg(not(target_os = "windows"))]
