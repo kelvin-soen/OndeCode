@@ -3,7 +3,7 @@
 Onde Code is Onde Inference's ACP-compatible coding agent for model fine-tuning and deployment.
 
 It speaks the [Agent Client Protocol](https://agentclientprotocol.com) (ACP), so it runs inside any
-ACP editor (Zed, JetBrains, Neovim and others), and it has its own TUI for the terminal. It is
+ACP editor (Zed, JetBrains, Xcode, Neovim and others), and it has its own TUI for the terminal. It is
 written in Rust on the official [ACP Rust SDK](https://github.com/agentclientprotocol/rust-sdk).
 Inference comes from [Onde Inference](https://ondeinference.com) by default, and the agent also
 accepts any OpenAI API compatible endpoint.
