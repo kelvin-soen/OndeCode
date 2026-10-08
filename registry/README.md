@@ -1,10 +1,24 @@
 # ACP registry entry
 
 `agent.json` is onde-code's entry in the [ACP registry](https://agentclientprotocol.com/get-started/registry)
-([agentclientprotocol/registry](https://github.com/agentclientprotocol/registry)). It mirrors
-`onde-code/agent.json` in the registry, where the icon sits next to it as `onde-code/icon.svg`
-(a copy of `assets/icon.svg`). The first submission is
-[agentclientprotocol/registry#652](https://github.com/agentclientprotocol/registry/pull/652).
+([agentclientprotocol/registry](https://github.com/agentclientprotocol/registry)), kept here for
+the first submission: [agentclientprotocol/registry#652](https://github.com/agentclientprotocol/registry/pull/652).
+In the registry it lives at `onde-code/agent.json`, with a copy of `assets/icon.svg` next to it as
+`onde-code/icon.svg`.
+
+Once #652 is merged, this folder is not part of the release process. The registry's
+`update-versions` workflow runs every hour, finds new GitHub releases of this repo, and commits
+the new version to the registry's `main` itself: it swaps the version in each archive URL
+(`/v1.0.0/` becomes `/v1.1.0/`) and takes the `sha256` values from the digests GitHub records for
+the release assets. That works as long as:
+
+- releases are tagged `v<version>` and are not marked as prereleases,
+- the archive names stay version-free (`onde-code-darwin-arm64.tar.gz` and so on), which
+  `.github/workflows/release.yml` takes care of,
+- all five archives are attached to the release.
+
+The automation only touches the version, archive URLs and hashes. Changing anything else in the
+listing (description, authors, icon) still takes a PR to the registry.
 
 What the registry checks, and where this repo covers it:
 
@@ -16,9 +30,11 @@ What the registry checks, and where this repo covers it:
   version in `Cargo.toml`.
 - `assets/icon.svg` is a 16×16 monochrome icon drawn with `currentColor`.
 
-## Updating the entry for a release
+## Moving the first submission to a new release
 
-1. Bump `version` in `Cargo.toml` on `main`, then tag that commit and push the tag:
+Only needed while #652 is still open, for example to submit v1.0.0 instead of v0.3.1.
+
+1. Tag the release on `main` (the tag must match `version` in `Cargo.toml`) and push it:
 
    ```sh
    git tag v1.0.0 origin/main && git push origin v1.0.0
@@ -33,7 +49,7 @@ What the registry checks, and where this repo covers it:
    It downloads the five archives, hashes them, and writes the version, URLs and `sha256`
    values. Commit the result here.
 
-3. In a registry fork, copy the files and validate:
+3. In the registry fork, copy the files and validate:
 
    ```sh
    cp ../OndeCode/registry/agent.json onde-code/agent.json
@@ -44,4 +60,4 @@ What the registry checks, and where this repo covers it:
    The script checks that every archive URL answers with HTTP 200, so run it after the release
    is published.
 
-4. Push to the fork. While #652 is open, that updates it; after it merges, open a new PR.
+4. Push to the fork's `add-onde-code` branch, which updates #652.

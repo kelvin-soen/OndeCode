@@ -65,7 +65,8 @@ jobs:
             || gh release view "$GITHUB_REF_NAME" >/dev/null
           gh release upload "$GITHUB_REF_NAME" "$asset" --clobber
 
-  # One checksums.txt for all archives; the ACP registry entry pins these sha256 values.
+  # One checksums.txt for all archives, for anyone verifying a download. The ACP registry reads
+  # the same hashes from the digests GitHub records for each release asset.
   checksums:
     needs: build
     runs-on: ubuntu-latest

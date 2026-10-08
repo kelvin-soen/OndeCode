@@ -174,7 +174,7 @@ need no API key or network. `tests/acp_integration.rs` drives the agent with the
 | `src/tools.rs` | tool schemas and execution, permissions, client `fs/*` and `terminal/*` routing |
 | `src/mcp.rs` | stdio MCP client: handshake, tool listing, `tools/call` |
 | `src/tui.rs` | the ratatui terminal UI, an ACP client that runs the agent as a subprocess |
-| `registry/` | the ACP registry entry and how to update it for a release |
+| `registry/` | the first ACP registry submission; later releases are picked up by the registry |
 
 Releases are cut by pushing a `v*` tag that matches the version in `Cargo.toml`. The release
 workflow builds all five targets and attaches the archives and `checksums.txt` to the GitHub
