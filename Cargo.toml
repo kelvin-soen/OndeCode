@@ -7,19 +7,19 @@ description = "Onde Code is Onde Inference's ACP-compatible coding agent for mod
 repository = "https://github.com/kelvin-soen/OndeCode"
 
 [dependencies]
+# Onde Agent Platform: the ACP server, terminal UI and MCP layer, from the onde-ed workspace.
+ed-acp = "1.2.0"
+ed-acp-tui = "1.2.0"
 agent-client-protocol = "2.2"
 anyhow = "1.0.104"
-crossterm = { version = "0.29.0", features = ["event-stream"] }
+async-trait = "0.1"
 directories = "6.0.0"
-futures = "0.3.34"
-ratatui = { version = "0.30.2", default-features = false, features = ["crossterm", "layout-cache", "unstable-rendered-line-info"] }
-reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "stream"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 tokio = { version = "1.53.1", features = ["full"] }
-tokio-util = "0.7.19"
 tracing = "0.1.44"
-tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+
+[dev-dependencies]
 uuid = { version = "1.27.0", features = ["v4"] }
 
 [[bin]]
