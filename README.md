@@ -43,9 +43,9 @@ onde-code                # terminal UI
 ```
 
 `--setup` stores the key in the platform config dir: `~/Library/Application Support/ondecode/env`
-on macOS, `~/.config/ondecode/env` on Linux, `%APPDATA%\ondecode\env` on Windows. If
-`ONDE_CODE_PROVIDER` or any provider key is set in the environment, the stored file is ignored,
-so CI and editor configs can pass a key directly.
+on macOS, `~/.config/ondecode/env` on Linux, `%APPDATA%\ondecode\env` on Windows. A variable set
+in the environment wins over the same one in that file, so CI and editor configs can pass a key
+directly.
 
 ## Use it in an editor
 
@@ -109,8 +109,8 @@ protocol an editor does, so the terminal and the editor exercise the same code p
 - **Permissions:** writes and commands ask through `session/request_permission` with allow once,
   always allow, reject once and always reject. `--yolo`, `ONDE_CODE_YOLO=1` or the auto-approve
   toggle skip the prompt.
-- **MCP:** stdio MCP servers passed in `session/new`, `session/load` or `session/resume` are
-  started per session, and their tools are offered to the model as `mcp__<server>__<tool>`. A
+- **MCP:** MCP servers passed in `session/new`, `session/load` or `session/resume`, over stdio
+  or streamable HTTP, are connected per session, and their tools are offered to the model as `mcp__<server>__<tool>`. A
   server that fails to start is logged and skipped; the session still opens.
 - **Prompts:** text, images (sent to the model as vision input), embedded resources and
   `resource_link`s. `file://` links are read (through the client's
@@ -136,8 +136,9 @@ It also accepts any OpenAI API compatible endpoint. Point it there with `OPENAI_
 tool (function) calling.
 
 Onde Inference wins: whenever `ONDE_API_KEY` is set, the agent uses it with the Onde Inference
-URL and ignores `OPENAI_API_KEY` and `OPENAI_BASE_URL`. `OPENAI_MODEL` still picks the model. To
-point it at a local or staging Onde Inference deployment, set `ONDE_BASE_URL`.
+URL and ignores `OPENAI_API_KEY` and `OPENAI_BASE_URL`. `ONDE_CODE_MODEL` (or `OPENAI_MODEL`)
+still picks the model. To point it at a local or staging Onde Inference deployment, set
+`ONDE_BASE_URL`.
 To use another endpoint while `ONDE_API_KEY` is set, set `ONDE_CODE_PROVIDER=openai`.
 
 ```sh
@@ -155,17 +156,18 @@ onde-code --list-models     # what the configured endpoint serves
 | `ONDE_BASE_URL` | `https://cloud.ondeinference.com/v1` | Onde Inference base URL, for a local or staging deployment |
 | `OPENAI_BASE_URL` | `https://api.openai.com/v1` | base URL of an OpenAI API compatible endpoint |
 | `OPENAI_API_KEY` | unset | bearer token for that endpoint |
-| `OPENAI_MODEL` | `onde-kkk` (Onde Inference), `gpt-4o-mini` (other endpoints) | model id; must support tool calling |
+| `ONDE_CODE_MODEL` | `OPENAI_MODEL` | model id for either provider; must support tool calling |
+| `OPENAI_MODEL` | `onde-kkk` (Onde Inference), `gpt-4o-mini` (other endpoints) | model id when `ONDE_CODE_MODEL` is unset |
 | `ONDE_CODE_MODELS` | listed from `/models` | comma-separated models for the editor's model picker |
 | `ONDE_CODE_YOLO` | unset | `1` or `true` approves every tool call |
 | `ONDE_CODE_COMMAND_TIMEOUT_SECS` | `120` | how long `run_command` may run before it is killed |
-| `ONDE_CODE_SESSIONS_DIR` | `ondecode/sessions` in the local data dir | where sessions are saved (`~/Library/Application Support` on macOS, `~/.local/share` on Linux, `%LOCALAPPDATA%` on Windows) |
+| `ONDE_CODE_DATA_DIR` | the config dir above | where the stored key and `sessions/` live |
 | `ONDE_CODE_CONTEXT_WINDOW` | `128000` | context size reported in `usage_update` |
 | `ONDE_CODE_SURFACE` | `acp` | set to `tui` by the terminal UI |
 | `RUST_LOG` | unset | log filter; logs go to stderr, never stdout |
 
 ```
-onde-code [--acp] [--yolo] [--list-models] [--root <path>...] [--setup]
+onde-code [--acp] [--yolo] [--list-models] [--root <path>...] [--setup] [--version]
 ```
 
 ## Development
@@ -181,13 +183,14 @@ need no API key or network. `tests/acp_integration.rs` drives the agent with the
 
 | Path | |
 |------|---|
-| `src/main.rs` | ACP handlers, sessions, config options, slash commands, the agent loop |
-| `src/llm.rs` | provider config and the streaming chat completions client |
-| `src/tools.rs` | tool schemas and execution, permissions, client `fs/*` and `terminal/*` routing |
-| `src/store.rs` | sessions on disk, so threads survive a restart |
-| `src/mcp.rs` | stdio MCP client: handshake, tool listing, `tools/call` |
-| `src/tui.rs` | the ratatui terminal UI, an ACP client that runs the agent as a subprocess |
+| `src/main.rs` | command line: flags, `--setup`, `--list-models`, and which mode to run |
+| `src/profile.rs` | the coding agent's prompt, tools and `/models` and `/setup` commands |
+| `src/legacy.rs` | moves sessions saved by Onde Code 1.0 into the current store |
 | `registry/` | the first ACP registry submission; later releases are picked up by the registry |
+
+The ACP server, the chat completions client, the workspace tools, sessions on disk, MCP servers and
+the terminal UI come from the Onde Agent Platform crates
+[`ed-acp`](https://crates.io/crates/ed-acp) and [`ed-acp-tui`](https://crates.io/crates/ed-acp-tui).
 
 Releases are cut by pushing a `v*` tag that matches the version in `Cargo.toml`. The release
 workflow builds all five targets and attaches the archives and `checksums.txt` to the GitHub
