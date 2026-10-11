@@ -1,0 +1,185 @@
+name: winget Release
+
+# Dispatched manually once the GitHub release and its checksums.txt exist.
+#
+# winget manifests live in microsoft/winget-pkgs, and `wingetcreate update`
+# only works on a package that is already there. So this workflow branches:
+#
+#   - package already in winget-pkgs -> `wingetcreate update`, which rewrites
+#     the URL and re-hashes the installer for us.
+#   - package not there yet -> render the manifests in packaging/winget/ and
+#     `wingetcreate submit` them as a new package.
+#
+# The second path only runs once, but keeping it here means a first release
+# does not need someone to sit at a Windows box running `wingetcreate new`
+# interactively.
+#
+# onde-code ships a single Windows x64 zip (onde-code-windows-x64.zip).
+# The SHA256 is extracted from the combined checksums.txt that the release
+# workflow uploads after all build jobs finish.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v1.0.2)"
+        required: true
+
+concurrency:
+  # Queue a re-dispatched tag behind the original instead of cancelling it:
+  # a cancelled mid-publish run can leave a channel half-updated, whereas a
+  # queued duplicate just hits the "already published" check and exits clean.
+  group: ${{ github.workflow }}-${{ github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  REPO: kelvin-soen/OndeCode
+  PACKAGE_IDENTIFIER: KelvinSoen.onde-code
+
+jobs:
+  submit-winget-manifest:
+    name: Submit winget manifest
+    # wingetcreate is a Windows-only tool.
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Resolve tag, version and release date
+        id: release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ github.event.inputs.tag }}"
+          VERSION="${TAG#v}"
+          # wingetcreate wants ReleaseDate as YYYY-MM-DD.
+          DATE=$(gh release view "$TAG" --repo "$REPO" --json publishedAt --jq '.publishedAt[0:10]')
+
+          echo "tag=${TAG}"         >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "date=${DATE}"       >> "$GITHUB_OUTPUT"
+
+      - name: Extract SHA256 from checksums.txt
+        id: sha
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ steps.release.outputs.tag }}"
+          mkdir -p artifacts
+          gh release download "$TAG" --repo "$REPO" --pattern "checksums.txt" --dir artifacts/
+
+          # checksums.txt lines: "<hash>  <filename>"
+          # The schema wants 64 uppercase hex characters.
+          SHA_X64=$(grep 'onde-code-windows-x64\.zip' artifacts/checksums.txt \
+            | awk '{print $1}' | tr '[:lower:]' '[:upper:]')
+
+          if [ -z "$SHA_X64" ]; then
+            echo "::error::Could not find onde-code-windows-x64.zip in checksums.txt"
+            exit 1
+          fi
+
+          echo "sha_x64=${SHA_X64}" >> "$GITHUB_OUTPUT"
+
+      - name: Check whether the package is already in winget-pkgs
+        id: exists
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Manifests are filed under the lowercased first letter of the
+          # publisher, e.g. manifests/k/KelvinSoen/onde-code.
+          PUBLISHER="${PACKAGE_IDENTIFIER%%.*}"
+          NAME="${PACKAGE_IDENTIFIER#*.}"
+          FIRST=$(echo "${PUBLISHER:0:1}" | tr '[:upper:]' '[:lower:]')
+          PATH_IN_REPO="manifests/${FIRST}/${PUBLISHER}/${NAME}"
+
+          if gh api "repos/microsoft/winget-pkgs/contents/${PATH_IN_REPO}" >/dev/null 2>&1; then
+            echo "Found ${PACKAGE_IDENTIFIER} at ${PATH_IN_REPO}; submitting an update."
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No ${PACKAGE_IDENTIFIER} at ${PATH_IN_REPO}; submitting it as a new package."
+            echo "found=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Render manifests for a first submission
+        if: steps.exists.outputs.found == 'false'
+        shell: bash
+        run: |
+          TAG="${{ steps.release.outputs.tag }}"
+          VERSION="${{ steps.release.outputs.version }}"
+          SHA_X64="${{ steps.sha.outputs.sha_x64 }}"
+          RELEASE_DATE="${{ steps.release.outputs.date }}"
+
+          mkdir -p manifests
+
+          for template in packaging/winget/*.yaml.in; do
+            out="manifests/$(basename "$template" .in)"
+            sed \
+              -e "s|@VERSION@|${VERSION}|g" \
+              -e "s|@TAG@|${TAG}|g" \
+              -e "s|@REPO@|${REPO}|g" \
+              -e "s|@SHA_X64@|${SHA_X64}|g" \
+              -e "s|@RELEASE_DATE@|${RELEASE_DATE}|g" \
+              "$template" > "$out"
+
+            echo "--- ${out} ---"
+            cat "$out"
+          done
+
+      - name: Download wingetcreate
+        shell: pwsh
+        run: Invoke-WebRequest -Uri "https://aka.ms/wingetcreate/latest" -OutFile wingetcreate.exe
+
+      - name: Submit new package
+        if: steps.exists.outputs.found == 'false'
+        shell: pwsh
+        env:
+          WINGET_CREATE_GITHUB_TOKEN: ${{ secrets.WINGET_TOKEN }}
+        run: |
+          if (-not $env:WINGET_CREATE_GITHUB_TOKEN) {
+            Write-Error "WINGET_TOKEN is not set. It needs a PAT with public_repo scope so wingetcreate can fork microsoft/winget-pkgs and open the manifest PR."
+          }
+
+          $version = "${{ steps.release.outputs.version }}"
+
+          # --no-open because the runner has no browser to open the PR in.
+          .\wingetcreate.exe submit manifests `
+            --prtitle "New package: $env:PACKAGE_IDENTIFIER version $version" `
+            --no-open
+
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "wingetcreate submit failed with exit code $LASTEXITCODE"
+          }
+
+      - name: Submit manifest update
+        if: steps.exists.outputs.found == 'true'
+        shell: pwsh
+        env:
+          WINGET_CREATE_GITHUB_TOKEN: ${{ secrets.WINGET_TOKEN }}
+        run: |
+          if (-not $env:WINGET_CREATE_GITHUB_TOKEN) {
+            Write-Error "WINGET_TOKEN is not set. It needs a PAT with public_repo scope so wingetcreate can fork microsoft/winget-pkgs and open the manifest PR."
+          }
+
+          $tag     = "${{ steps.release.outputs.tag }}"
+          $version = "${{ steps.release.outputs.version }}"
+          $base    = "https://github.com/${env:REPO}/releases/download/$tag"
+
+          # Single x64 zip installer — no arch suffix needed in the URL hint.
+          .\wingetcreate.exe update $env:PACKAGE_IDENTIFIER `
+            --version $version `
+            --urls "$base/onde-code-windows-x64.zip|x64" `
+            --release-notes-url "https://github.com/${env:REPO}/releases/tag/$tag" `
+            --release-date "${{ steps.release.outputs.date }}" `
+            --prtitle "Update $env:PACKAGE_IDENTIFIER to version $version" `
+            --submit `
+            --no-open
+
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "wingetcreate failed with exit code $LASTEXITCODE"
+          }
