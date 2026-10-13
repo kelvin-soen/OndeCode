@@ -1,13 +1,13 @@
-# yaml-language-server: $schema=https://aka.ms/winget-manifest.defaultLocale.1.6.0.schema.json
-PackageIdentifier: KelvinSoen.onde-code
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.defaultLocale.1.12.0.schema.json
+PackageIdentifier: OndeInference.onde-code
 PackageVersion: @VERSION@
 PackageLocale: en-US
-Publisher: KelvinSoen
-PublisherUrl: https://github.com/kelvin-soen
+Publisher: OndeInference
+PublisherUrl: https://ondeinference.com/
 PublisherSupportUrl: https://github.com/@REPO@/issues
 PackageName: Onde Code
 PackageUrl: https://github.com/@REPO@
-License: MIT OR Apache-2.0
+License: Apache-2.0
 LicenseUrl: https://github.com/@REPO@/blob/main/LICENSE
 ShortDescription: Onde Code is Onde Inference's ACP-compatible coding agent for model fine-tuning and deployment.
 Description: |-
@@ -29,4 +29,4 @@ Documentations:
   - DocumentLabel: Readme
     DocumentUrl: https://github.com/@REPO@/blob/main/README.md
 ManifestType: defaultLocale
-ManifestVersion: 1.6.0
+ManifestVersion: 1.12.0
