@@ -140,7 +140,7 @@ jobs:
           echo "issue_number=${ISSUE_URL##*/}" >> "$GITHUB_OUTPUT"
 
       # Leave a gap so the issue and the PR aren't posted seconds apart.
-      - name: Wait before opening the PR
+      - name: Sebat dulu ...
         shell: bash
         run: sleep $(( RANDOM % 61 + 150 ))
 
