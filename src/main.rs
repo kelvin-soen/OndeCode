@@ -96,10 +96,12 @@ async fn run() -> anyhow::Result<()> {
     } else {
         let llm = LlmConfig::from_env(&INFO.env);
         if llm.api_key.is_none() {
-            anyhow::bail!(
+            // Exit 0: winget's validator launches the bare exe on a console and expects success.
+            eprintln!(
                 "No API key configured. Set ONDE_API_KEY (or OPENAI_API_KEY) or run `{} --setup`.",
                 INFO.name
             );
+            return Ok(());
         }
         let mut tui = TuiConfig::current_exe(INFO.name, opts.yolo)?;
         tui.env.push((INFO.env.var("SURFACE"), "tui".to_string()));

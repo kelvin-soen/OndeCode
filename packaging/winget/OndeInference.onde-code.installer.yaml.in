@@ -1,0 +1,17 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.installer.1.12.0.schema.json
+PackageIdentifier: OndeInference.onde-code
+PackageVersion: @VERSION@
+InstallerType: zip
+# `NestedInstallerType` and `NestedInstallerFiles` tell winget where to find
+# the exe inside the zip and what command shim to place on PATH.
+NestedInstallerType: portable
+NestedInstallerFiles:
+  - RelativeFilePath: onde-code.exe
+    PortableCommandAlias: onde-code
+ReleaseDate: "@RELEASE_DATE@"
+Installers:
+  - Architecture: x64
+    InstallerUrl: https://github.com/@REPO@/releases/download/@TAG@/onde-code-windows-x64.zip
+    InstallerSha256: @SHA_X64@
+ManifestType: installer
+ManifestVersion: 1.12.0
