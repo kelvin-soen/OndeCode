@@ -85,6 +85,32 @@ jobs:
 
           echo "sha_x64=${SHA_X64}" >> "$GITHUB_OUTPUT"
 
+      # Step 1 of the two-token flow: open the tracking issue *first*, under the
+      # package's owning account (paydii), so the winget-pkgs PR opened in step 2
+      # can reference it. WINGET_ISSUE_TOKEN is a classic PAT with public_repo
+      # scope; github.token is not used here because it would attribute the issue
+      # to the Actions bot instead of the account that files the PR.
+      - name: Open tracking issue
+        id: issue
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.WINGET_ISSUE_TOKEN }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::error::WINGET_ISSUE_TOKEN is not set. It needs a classic PAT with public_repo scope under the package's owning account so the tracking issue is filed before the winget-pkgs PR."
+            exit 1
+          fi
+
+          TAG="${{ steps.release.outputs.tag }}"
+          VERSION="${{ steps.release.outputs.version }}"
+
+          URL=$(gh issue create --repo "$REPO" \
+            --title "Publish ${PACKAGE_IDENTIFIER} ${VERSION} to winget" \
+            --body "Tracking the winget-pkgs submission for \`${PACKAGE_IDENTIFIER}\` version ${VERSION} (${TAG}). The microsoft/winget-pkgs PR will reference this issue.")
+
+          echo "Opened tracking issue: ${URL}"
+          echo "number=${URL##*/}" >> "$GITHUB_OUTPUT"
+
       - name: Check whether the package is already in winget-pkgs
         id: exists
         shell: bash
@@ -135,51 +161,93 @@ jobs:
         shell: pwsh
         run: Invoke-WebRequest -Uri "https://aka.ms/wingetcreate/latest" -OutFile wingetcreate.exe
 
+      # Step 2 of the two-token flow: open the PR with WINGET_PR_TOKEN (mapped to
+      # WINGET_CREATE_GITHUB_TOKEN, which is the only env var wingetcreate reads).
+      # Both tokens are classic PATs under the same account; keeping them separate
+      # preserves the issue-then-PR ordering the issue number depends on.
       - name: Submit new package
+        id: submit
         if: steps.exists.outputs.found == 'false'
         shell: pwsh
         env:
-          WINGET_CREATE_GITHUB_TOKEN: ${{ secrets.WINGET_TOKEN }}
+          WINGET_CREATE_GITHUB_TOKEN: ${{ secrets.WINGET_PR_TOKEN }}
         run: |
           if (-not $env:WINGET_CREATE_GITHUB_TOKEN) {
-            Write-Error "WINGET_TOKEN is not set. It needs a PAT with public_repo scope so wingetcreate can fork microsoft/winget-pkgs and open the manifest PR."
+            Write-Error "WINGET_PR_TOKEN is not set. It needs a classic PAT with public_repo scope so wingetcreate can fork microsoft/winget-pkgs and open the manifest PR."
           }
 
           $version = "${{ steps.release.outputs.version }}"
 
           # --no-open because the runner has no browser to open the PR in.
-          .\wingetcreate.exe submit manifests `
+          $output = .\wingetcreate.exe submit manifests `
             --prtitle "New package: $env:PACKAGE_IDENTIFIER version $version" `
-            --no-open
+            --no-open 2>&1 | Tee-Object -Variable raw
+          $raw | Out-String | Write-Host
 
           if ($LASTEXITCODE -ne 0) {
             Write-Error "wingetcreate submit failed with exit code $LASTEXITCODE"
           }
 
+          # Capture the opened PR URL so the next step can link the tracking issue.
+          $prUrl = (($raw | Out-String) | Select-String -Pattern 'https://github.com/microsoft/winget-pkgs/pull/\d+').Matches.Value | Select-Object -First 1
+          if ($prUrl) {
+            "pr_url=$prUrl" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          }
+
+      # Step 2 of the two-token flow (update path): same WINGET_PR_TOKEN mapping.
       - name: Submit manifest update
+        id: update
         if: steps.exists.outputs.found == 'true'
         shell: pwsh
         env:
-          WINGET_CREATE_GITHUB_TOKEN: ${{ secrets.WINGET_TOKEN }}
+          WINGET_CREATE_GITHUB_TOKEN: ${{ secrets.WINGET_PR_TOKEN }}
         run: |
           if (-not $env:WINGET_CREATE_GITHUB_TOKEN) {
-            Write-Error "WINGET_TOKEN is not set. It needs a PAT with public_repo scope so wingetcreate can fork microsoft/winget-pkgs and open the manifest PR."
+            Write-Error "WINGET_PR_TOKEN is not set. It needs a classic PAT with public_repo scope so wingetcreate can fork microsoft/winget-pkgs and open the manifest PR."
           }
 
           $tag     = "${{ steps.release.outputs.tag }}"
           $version = "${{ steps.release.outputs.version }}"
           $base    = "https://github.com/${env:REPO}/releases/download/$tag"
 
-          # Single x64 zip installer — no arch suffix needed in the URL hint.
-          .\wingetcreate.exe update $env:PACKAGE_IDENTIFIER `
+          # onde-code ships a zip containing a single portable exe. The |x64
+          # suffix selects which installer entry to re-hash — it is the winget
+          # architecture name, not the asset's own arch string.
+          $output = .\wingetcreate.exe update $env:PACKAGE_IDENTIFIER `
             --version $version `
             --urls "$base/onde-code-windows-x64.zip|x64" `
             --release-notes-url "https://github.com/${env:REPO}/releases/tag/$tag" `
             --release-date "${{ steps.release.outputs.date }}" `
             --prtitle "Update $env:PACKAGE_IDENTIFIER to version $version" `
             --submit `
-            --no-open
+            --no-open 2>&1 | Tee-Object -Variable raw
+          $raw | Out-String | Write-Host
 
           if ($LASTEXITCODE -ne 0) {
             Write-Error "wingetcreate failed with exit code $LASTEXITCODE"
           }
+
+          # Capture the opened PR URL so the next step can link the tracking issue.
+          $prUrl = (($raw | Out-String) | Select-String -Pattern 'https://github.com/microsoft/winget-pkgs/pull/\d+').Matches.Value | Select-Object -First 1
+          if ($prUrl) {
+            "pr_url=$prUrl" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          }
+
+      # Close the issue-then-PR loop: comment the tracking issue onto the PR that
+      # step 2 opened. continue-on-error so a missed URL parse never fails a
+      # release that already shipped its manifest PR.
+      - name: Link tracking issue on the winget-pkgs PR
+        if: steps.issue.outputs.number != ''
+        continue-on-error: true
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.WINGET_PR_TOKEN }}
+        run: |
+          PR_URL="${{ steps.update.outputs.pr_url }}${{ steps.submit.outputs.pr_url }}"
+          if [ -z "$PR_URL" ]; then
+            echo "::warning::Could not determine the winget-pkgs PR URL; skipping the issue link. Link ${REPO}#${{ steps.issue.outputs.number }} by hand."
+            exit 0
+          fi
+
+          gh pr comment "$PR_URL" --repo microsoft/winget-pkgs \
+            --body "Related upstream issue: ${REPO}#${{ steps.issue.outputs.number }}"
