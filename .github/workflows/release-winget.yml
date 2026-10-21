@@ -1,4 +1,4 @@
-name: winget Release
+name: Code Release winget
 
 # Dispatched manually once the GitHub release and its checksums.txt exist.
 #

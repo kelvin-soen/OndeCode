@@ -62,7 +62,7 @@ git push origin main
 git push origin vX.Y.Z
 ```
 
-GitHub Actions (`release.yml`) triggers on the `v*` tag and:
+GitHub Actions (`release-github.yml`) triggers on the `v*` tag and:
 
 1. **verify-version** — confirms tag == `Cargo.toml`
 2. **build** (parallel) — compiles five targets:

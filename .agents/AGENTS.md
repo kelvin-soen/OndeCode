@@ -38,4 +38,4 @@ Things that span files:
 
 ## Releases
 
-Push a `v*` tag matching the `Cargo.toml` version; `release.yml` builds five targets (macOS arm64/x64, Linux arm64/x64, Windows x64) and attaches archives plus `checksums.txt`.
+Push a `v*` tag matching the `Cargo.toml` version; `release-github.yml` builds five targets (macOS arm64/x64, Linux arm64/x64, Windows x64) and attaches archives plus `checksums.txt`.
