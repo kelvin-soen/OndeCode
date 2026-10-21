@@ -1,5 +1,5 @@
 # yaml-language-server: $schema=https://aka.ms/winget-manifest.defaultLocale.1.12.0.schema.json
-PackageIdentifier: OndeInference.onde-code
+PackageIdentifier: OndeInference.OndeCode
 PackageVersion: @VERSION@
 PackageLocale: en-US
 Publisher: OndeInference
