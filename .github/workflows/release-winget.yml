@@ -36,7 +36,7 @@ permissions:
 
 env:
   REPO: kelvin-soen/OndeCode
-  PACKAGE_IDENTIFIER: OndeInference.onde-code
+  PACKAGE_IDENTIFIER: OndeInference.OndeCode
 
 jobs:
   submit-winget-manifest:
@@ -151,7 +151,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           # Manifests are filed under the lowercased first letter of the
-          # publisher, e.g. manifests/o/OndeInference/onde-code.
+          # publisher, e.g. manifests/o/OndeInference/OndeCode.
           PUBLISHER="${PACKAGE_IDENTIFIER%%.*}"
           NAME="${PACKAGE_IDENTIFIER#*.}"
           FIRST=$(echo "${PUBLISHER:0:1}" | tr '[:upper:]' '[:lower:]')
