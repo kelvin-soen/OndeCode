@@ -14,7 +14,7 @@ the release assets. That works as long as:
 
 - releases are tagged `v<version>` and are not marked as prereleases,
 - the archive names stay version-free (`onde-code-darwin-arm64.tar.gz` and so on), which
-  `.github/workflows/release.yml` takes care of,
+  `.github/workflows/release-github.yml` takes care of,
 - all five archives are attached to the release.
 
 The automation only touches the version, archive URLs and hashes. Changing anything else in the
@@ -25,7 +25,7 @@ What the registry checks, and where this repo covers it:
 - `initialize` returns a `terminal` auth method (`terminal-setup`, runs `onde-code --setup`). The
   registry's CI starts the binary with an empty `HOME`, so that method is what it sees.
 - `session/new` and `session/prompt` return `AUTH_REQUIRED` until a key is configured.
-- `.github/workflows/release.yml` builds the five registry platforms on a `v*` tag and attaches
+- `.github/workflows/release-github.yml` builds the five registry platforms on a `v*` tag and attaches
   the archives and `checksums.txt` to the release. It refuses a tag that doesn't match the
   version in `Cargo.toml`.
 - `assets/icon.svg` is a 16×16 monochrome icon drawn with `currentColor`.
