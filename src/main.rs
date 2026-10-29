@@ -7,6 +7,8 @@
 //! OPENAI_BASE_URL, OPENAI_API_KEY and OPENAI_MODEL for any OpenAI API compatible endpoint.
 //! Set ONDE_CODE_YOLO=1 to skip permission prompts. Logs go to stderr (RUST_LOG).
 
+mod auth;
+mod browser_auth;
 mod legacy;
 mod profile;
 
@@ -20,13 +22,14 @@ use ed_acp_tui::TuiConfig;
 use profile::{INFO, OndeCode};
 
 const USAGE: &str = "\
-Usage: onde-code [--acp] [--yolo] [--list-models] [--root <path>...] [--setup] [--version]
+Usage: onde-code [--acp] [--yolo] [--list-models] [--root <path>...] [--login] [--setup] [--version]
 
   (no args)      interactive terminal UI (when run from a terminal)
   --acp          speak ACP over stdio for an editor (default when stdin is not a terminal)
   --yolo         approve file edits and commands without asking
   --list-models  list the models the configured endpoint serves, then exit
   --root <path>  add an extra workspace root (repeatable; TUI mode only)
+  --login        sign in with your browser: pick an Onde Inference app to connect
   --setup        interactive first-run setup: choose a provider and store an API key
   --version      print the version
 ";
@@ -75,14 +78,16 @@ async fn run() -> anyhow::Result<()> {
                 }
                 roots.push(path);
             }
-            "--acp" | "--yolo" | "--list-models" | "--setup" => {}
+            "--acp" | "--yolo" | "--list-models" | "--login" | "--setup" => {}
             bad => anyhow::bail!("unknown argument {bad}\n\n{USAGE}"),
         }
         i += 1;
     }
     let mut opts = ServeOptions::from_env(&INFO);
     opts.yolo |= has("--yolo");
-    if has("--setup") {
+    if has("--login") {
+        auth::login_from_terminal().await?;
+    } else if has("--setup") {
         cli::setup(&INFO).await?;
     } else if has("--list-models") {
         cli::list_models(&INFO).await?;
@@ -98,7 +103,8 @@ async fn run() -> anyhow::Result<()> {
         if llm.api_key.is_none() {
             // Exit 0: winget's validator launches the bare exe on a console and expects success.
             eprintln!(
-                "No API key configured. Set ONDE_API_KEY (or OPENAI_API_KEY) or run `{} --setup`.",
+                "No API key configured. Run `{0} --login` to sign in with your browser, set ONDE_API_KEY \
+                 (or OPENAI_API_KEY), or run `{0} --setup`.",
                 INFO.name
             );
             return Ok(());

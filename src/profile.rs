@@ -7,8 +7,11 @@ use std::sync::Arc;
 use agent_client_protocol::schema::v1::AvailableCommand;
 use async_trait::async_trait;
 use ed_acp::{
-    AgentInfo, CommandCtx, LlmEnv, Profile, PromptCtx, SessionCtx, Toolset, WorkspaceTools, llm,
+    AgentInfo, AuthProvider, CommandCtx, LlmEnv, Profile, PromptCtx, SessionCtx, Toolset,
+    WorkspaceTools, llm,
 };
+
+use crate::auth::OndeAuth;
 
 pub const INFO: AgentInfo = AgentInfo {
     name: "onde-code",
@@ -34,6 +37,10 @@ impl Profile for OndeCode {
         system_prompt(ctx.surface, ctx.cwd, ctx.roots)
     }
 
+    fn auth(&self) -> Option<Arc<dyn AuthProvider>> {
+        Some(Arc::new(OndeAuth))
+    }
+
     fn toolsets(&self) -> Vec<Arc<dyn Toolset>> {
         vec![Arc::new(WorkspaceTools)]
     }
@@ -54,10 +61,11 @@ impl Profile for OndeCode {
     }
 }
 
-const SETUP_REPLY: &str = "Run `onde-code --setup` in a terminal to store an Onde Inference \
-    key (or an OpenAI API compatible endpoint), then sign in again from your editor. You can \
-    also set `ONDE_API_KEY`, or `OPENAI_BASE_URL`, `OPENAI_API_KEY` and `OPENAI_MODEL`, in the \
-    agent's environment.";
+const SETUP_REPLY: &str = "Choose \"Sign in with Onde\" in your editor, or run `onde-code \
+    --login` in a terminal, to connect an Onde Inference app in your browser. To paste a key or \
+    use an OpenAI API compatible endpoint instead, run `onde-code --setup`. You can also set \
+    `ONDE_API_KEY`, or `OPENAI_BASE_URL`, `OPENAI_API_KEY` and `OPENAI_MODEL`, in the agent's \
+    environment.";
 
 fn models_reply(models: &[String], current: &str) -> String {
     let list = models

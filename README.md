@@ -37,12 +37,17 @@ Once it lands, editors that read the registry can install onde-code without the 
 ## Quick start
 
 ```sh
-onde-code --setup        # paste an Onde Inference key (or set up another endpoint); checked live, then stored
+onde-code --login        # sign in with your browser and pick an Onde Inference app
 cd my-project
 onde-code                # terminal UI
 ```
 
-`--setup` stores the key in the platform config dir: `~/Library/Application Support/ondecode/env`
+`--login` opens ondeinference.com. You sign in, pick an org and an app (or create one), and press
+Connect. The app key goes back to the agent through a one-time code and PKCE, so it never appears
+in a URL. It prints the URL too, for ssh and headless machines. Prefer to paste a key, or use another
+OpenAI API compatible endpoint? Run `onde-code --setup` instead (the key is checked live, then stored).
+
+Both store the key in the platform config dir: `~/Library/Application Support/ondecode/env`
 on macOS, `~/.config/ondecode/env` on Linux, `%APPDATA%\ondecode\env` on Windows. A variable set
 in the environment wins over the same one in that file, so CI and editor configs can pass a key
 directly.
@@ -67,11 +72,12 @@ Zed, add it to `settings.json`:
 }
 ```
 
-If no key is configured, the agent offers a terminal auth method that runs `onde-code --setup`,
-and answers `session/new`, `session/load`, `session/resume` and `session/prompt` with
-`AUTH_REQUIRED` until a key exists. Once `--setup` succeeds, the editor retries and the running
-agent picks up the stored key, so the open thread comes back without restarting anything. Logging
-out from the editor deletes the stored key.
+The agent offers a **Sign in with Onde** method, which opens ondeinference.com in your browser (as a
+URL prompt when the editor supports it). A key that already works, from the environment or the stored
+file, passes without opening anything. Until one exists the agent answers `session/new`, `session/load`, `session/resume` and `session/prompt` with
+`AUTH_REQUIRED`. Once you have signed in (or `--setup` succeeds), the running agent picks up the
+stored key, so the open thread comes back without restarting anything. Logging out from the editor
+deletes the stored key and the saved sign-in (`session.json`).
 
 In the editor you get:
 
@@ -153,6 +159,7 @@ onde-code --list-models     # what the configured endpoint serves
 |---------|---------|---|
 | `ONDE_CODE_PROVIDER` | detected from keys | `onde`, or `openai` for any OpenAI API compatible endpoint |
 | `ONDE_API_KEY` | unset | Onde Inference `app-id:app-secret`; selects Onde Inference |
+| `ONDE_WEB_URL` | `https://ondeinference.com` | where `--login` and "Sign in with Onde" send the browser, for a local or staging site |
 | `ONDE_BASE_URL` | `https://cloud.ondeinference.com/v1` | Onde Inference base URL, for a local or staging deployment |
 | `OPENAI_BASE_URL` | `https://api.openai.com/v1` | base URL of an OpenAI API compatible endpoint |
 | `OPENAI_API_KEY` | unset | bearer token for that endpoint |
@@ -167,7 +174,7 @@ onde-code --list-models     # what the configured endpoint serves
 | `RUST_LOG` | unset | log filter; logs go to stderr, never stdout |
 
 ```
-onde-code [--acp] [--yolo] [--list-models] [--root <path>...] [--setup] [--version]
+onde-code [--acp] [--yolo] [--list-models] [--root <path>...] [--login] [--setup] [--version]
 ```
 
 ## Development
@@ -183,8 +190,9 @@ need no API key or network. `tests/acp_integration.rs` drives the agent with the
 
 | Path | |
 |------|---|
-| `src/main.rs` | command line: flags, `--setup`, `--list-models`, and which mode to run |
+| `src/main.rs` | command line: flags, `--login`, `--setup`, `--list-models`, and which mode to run |
 | `src/profile.rs` | the coding agent's prompt, tools and `/models` and `/setup` commands |
+| `src/auth.rs`, `src/browser_auth.rs` | "Sign in with Onde" and `--login`: loopback + PKCE against ondeinference.com/connect |
 | `src/legacy.rs` | moves sessions saved by Onde Code 1.0 into the current store |
 | `registry/` | the first ACP registry submission; later releases are picked up by the registry |
 

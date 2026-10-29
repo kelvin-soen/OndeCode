@@ -204,16 +204,24 @@ async fn terminal_auth_is_only_offered_to_capable_clients() {
 
     let mut agent = Agent::spawn(&home, &as_refs(&env));
     let r = agent.initialize(false).await;
-    assert_eq!(r["result"]["authMethods"], json!([]));
+    // The browser sign-in is offered whatever the client can do.
+    let methods = r["result"]["authMethods"].as_array().unwrap();
+    assert_eq!(methods.len(), 1, "{r}");
+    assert_eq!(methods[0]["id"], "onde");
+    assert_eq!(methods[0]["name"], "Sign in with Onde");
     let caps = &r["result"]["agentCapabilities"];
     assert!(caps["sessionCapabilities"]["delete"].is_object(), "{caps}");
     assert!(caps["auth"]["logout"].is_object(), "{caps}");
 
     let mut agent = Agent::spawn(&home, &as_refs(&env));
     let r = agent.initialize(true).await;
-    let methods = r["result"]["authMethods"].as_array().unwrap();
-    assert_eq!(methods.len(), 1);
-    assert_eq!(methods[0]["id"], "terminal-setup");
+    let ids: Vec<&str> = r["result"]["authMethods"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["id"].as_str().unwrap())
+        .collect();
+    assert!(ids.contains(&"onde"), "{r}");
 
     std::fs::remove_dir_all(&home).ok();
 }
@@ -260,7 +268,9 @@ async fn authenticate_reloads_and_logout_removes_stored_key() {
     )
     .unwrap();
 
-    let mut agent = Agent::spawn(&home, &[("OPENAI_BASE_URL", "http://127.0.0.1:9/v1")]);
+    // The stored key is checked against the endpoint; the mock accepts any request.
+    let base_url = start_mock_llm(Arc::new(Mutex::new(Vec::new()))).await;
+    let mut agent = Agent::spawn(&home, &[("OPENAI_BASE_URL", base_url.as_str())]);
     agent.initialize(true).await;
 
     let r = agent
@@ -268,7 +278,7 @@ async fn authenticate_reloads_and_logout_removes_stored_key() {
         .await;
     assert_eq!(r["error"]["code"], -32602, "{r}");
     let r = agent
-        .call("authenticate", json!({"methodId": "terminal-setup"}))
+        .call("authenticate", json!({"methodId": "onde"}))
         .await;
     assert!(r.get("error").is_none(), "{r}");
 
