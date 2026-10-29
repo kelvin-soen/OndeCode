@@ -646,9 +646,9 @@ checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
 
 [[package]]
 name = "ed-acp"
-version = "1.3.3"
+version = "1.3.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "72875c7df466beeec849ab697b5715c74306c370fcdb596ef076c25f5a4581d4"
+checksum = "4b3a56eadf9da41f7754234bd289a094d8106ba441dabbfeab89caa712b5de7e"
 dependencies = [
  "agent-client-protocol",
  "anyhow",
@@ -669,9 +669,9 @@ dependencies = [
 
 [[package]]
 name = "ed-acp-tui"
-version = "1.3.3"
+version = "1.3.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9e44e00e1640efdced53163f22128ecda46f2ef02ab8796048c94df69a3720e7"
+checksum = "a4ec8b7b76efb3081e1740121f69f8755501c4daeb562140f6be99298ce357e9"
 dependencies = [
  "agent-client-protocol",
  "anyhow",
@@ -683,9 +683,9 @@ dependencies = [
 
 [[package]]
 name = "ed-mcp"
-version = "1.3.3"
+version = "1.3.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "09f7614c7e6082ff71160d931394662b00bb68e480d97c19cf6f66eb7b1579e3"
+checksum = "22c23d9ee98af7c04ff2ec31aaea8fe5f641a6605a7f8305f493f038455a1c61"
 dependencies = [
  "agent-client-protocol",
  "anyhow",
