@@ -185,22 +185,22 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings
 ```
 
 The tests start the real binary over stdio and point it at a mock chat completions server, so they
-need no API key or network. `tests/acp_integration.rs` drives the agent with the SDK's `Client`;
-`tests/acp_protocol.rs` sends raw JSON-RPC. CI runs fmt, clippy and the tests on Linux and macOS.
+need no API key or network. `crates/cli/tests/acp_integration.rs` drives the agent with the SDK's `Client`;
+`crates/cli/tests/acp_protocol.rs` sends raw JSON-RPC. CI runs fmt, clippy and the tests on Linux and macOS.
 
 | Path | |
 |------|---|
-| `src/main.rs` | command line: flags, `--login`, `--setup`, `--list-models`, and which mode to run |
-| `src/profile.rs` | the coding agent's prompt, tools and `/models` and `/setup` commands |
-| `src/auth.rs`, `src/browser_auth.rs` | "Sign in with Onde" and `--login`: loopback + PKCE against ondeinference.com/connect |
-| `src/legacy.rs` | moves sessions saved by Onde Code 1.0 into the current store |
+| `crates/cli/src/main.rs` | command line: flags, `--login`, `--setup`, `--list-models`, and which mode to run |
+| `crates/cli/src/profile.rs` | the coding agent's prompt, tools and `/models` and `/setup` commands |
+| `crates/cli/src/auth.rs`, `crates/cli/src/browser_auth.rs` | "Sign in with Onde" and `--login`: loopback + PKCE against ondeinference.com/connect |
+| `crates/cli/src/legacy.rs` | moves sessions saved by Onde Code 1.0 into the current store |
 | `registry/` | the first ACP registry submission; later releases are picked up by the registry |
 
 The ACP server, the chat completions client, the workspace tools, sessions on disk, MCP servers and
 the terminal UI come from the Onde Agent Platform crates
 [`ed-acp`](https://crates.io/crates/ed-acp) and [`ed-acp-tui`](https://crates.io/crates/ed-acp-tui).
 
-Releases are cut by pushing a `v*` tag that matches the version in `Cargo.toml`. The release
+Releases are cut by pushing a `v*` tag that matches the version in the root `Cargo.toml` (`[workspace.package]`). The release
 workflow builds all five targets and attaches the archives and `checksums.txt` to the GitHub
 release.
 

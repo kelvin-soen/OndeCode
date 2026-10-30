@@ -34,7 +34,7 @@ git branch -d <branch> ...
 
 ## 4. Update the version
 
-Edit `Cargo.toml`:
+Edit `version` under `[workspace.package]` in the root `Cargo.toml`:
 
 ```toml
 version = "X.Y.Z"
