@@ -71,7 +71,24 @@ GitHub Actions (`release-github.yml`) triggers on the `v*` tag and:
    - `windows-x64`
 3. **checksums** — produces `checksums.txt` over all archives
 
+`release-npm.yml` ("Code Release npm") triggers on the same tag: it re-checks
+the version, builds the five targets, publishes the five
+`@ondeinference/onde-code-<os>-<arch>` packages, then
+`@ondeinference/onde-code`. Publishing is skipped for a version that is
+already on npm, so re-running is safe.
+
 Watch the run at `https://github.com/kelvin-soen/OndeCode/actions`.
+
+After both workflows finish, confirm the npm package:
+
+```sh
+npm view @ondeinference/onde-code version
+```
+
+A package's first publish needs the `NPM_TOKEN` repo secret, because a Trusted
+Publisher can only be attached to a package that already exists. Afterwards add
+a Trusted Publisher (workflow `release-npm.yml`) on npmjs.com for each of the
+six packages.
 
 ## 7. If the release workflow fails
 

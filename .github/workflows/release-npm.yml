@@ -1,0 +1,194 @@
+name: Code Release npm
+
+# Publishes @ondeinference/onde-code and its five platform packages on the same v* tag that
+# release-github.yml builds from.
+#
+# Auth is npm Trusted Publishing (OIDC): once a package exists, add a Trusted Publisher for it on
+# npmjs.com pointing at this workflow, and no token is involved. A Trusted Publisher can only be
+# attached to a package that already exists, so the very first release publishes with the NPM_TOKEN
+# secret instead (NODE_AUTH_TOKEN below). After every package has a Trusted Publisher, delete the
+# secret.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v1.0.4)"
+        required: true
+
+concurrency:
+  # A re-pushed or re-dispatched tag fires this a second time. Queue the duplicate behind the
+  # original instead of cancelling it: cancelling a run mid-publish can leave a channel
+  # half-uploaded, whereas a queued duplicate just hits the "already published" check and exits
+  # clean.
+  group: ${{ github.workflow }}-${{ github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Same check as release-github.yml: the launcher's version comes from the tag, but the binary
+  # reports CARGO_PKG_VERSION, so a mismatch would publish a package that lies about its version.
+  verify-version:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+      - name: Tag matches Cargo.toml
+        shell: bash
+        env:
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          crate=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          if [ "$TAG" != "v$crate" ]; then
+            echo "::error::tag $TAG does not match Cargo.toml version $crate"
+            exit 1
+          fi
+
+  publish-npm-binaries:
+    name: Publish npm platform packages
+    needs: verify-version
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: aarch64-apple-darwin, os: macos-latest, node_os: darwin, node_arch: arm64 }
+          - { target: x86_64-apple-darwin, os: macos-15-intel, node_os: darwin, node_arch: x64 }
+          - { target: x86_64-unknown-linux-gnu, os: ubuntu-latest, node_os: linux, node_arch: x64 }
+          - { target: aarch64-unknown-linux-gnu, os: ubuntu-24.04-arm, node_os: linux, node_arch: arm64 }
+          - { target: x86_64-pc-windows-msvc, os: windows-latest, node_os: windows, node_arch: x64 }
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Set the release version
+        shell: bash
+        run: |
+          tag="${{ github.event.inputs.tag || github.ref_name }}"
+          echo "RELEASE_VERSION=${tag#v}" >> "$GITHUB_ENV"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: npm-${{ matrix.target }}
+      - run: cargo build --locked --release -p onde-code --target ${{ matrix.target }}
+
+      # The exe must not import the VC++ runtime DLLs (see .cargo/config.toml), or it fails to
+      # load on a machine without the redistributable.
+      - name: Check static CRT
+        if: matrix.node_os == 'windows'
+        shell: pwsh
+        run: ./packaging/windows/check-static-crt.ps1 -Path target/${{ matrix.target }}/release/onde-code.exe
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version-file: .nvmrc
+          registry-url: "https://registry.npmjs.org"
+
+      # Trusted Publishing needs npm >= 11.5.1, which is newer than what ships with Node 22.
+      - name: Upgrade npm for Trusted Publishing
+        shell: bash
+        run: npm install -g npm@latest
+
+      - name: Publish platform package to npm
+        shell: bash
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          cd packaging/npm
+
+          node_pkg="onde-code-${{ matrix.node_os }}-${{ matrix.node_arch }}"
+          cargo_bin="onde-code"
+          if [ "${{ matrix.node_os }}" = "windows" ]; then
+            cargo_bin="onde-code.exe"
+          fi
+
+          node ./scripts/render-platform-package.cjs \
+            "${node_pkg}" \
+            "${RELEASE_VERSION}" \
+            "${{ matrix.node_os }}" \
+            "${{ matrix.node_arch }}"
+
+          mkdir -p "${node_pkg}/bin"
+          cp "../../target/${{ matrix.target }}/release/${cargo_bin}" "${node_pkg}/bin/"
+
+          npm_package_name="@ondeinference/${node_pkg}"
+
+          # `npm view` exits non-zero both when the version is genuinely unpublished and when the
+          # registry could not be reached, so treat only an E404 as "not published yet". Anything
+          # else stops the job instead of publishing over a version that is already there.
+          if view_output=$(npm view "${npm_package_name}@${RELEASE_VERSION}" version 2>&1); then
+            echo "${npm_package_name}@${RELEASE_VERSION} already exists on npm, skipping publish"
+            exit 0
+          elif ! grep -q "E404" <<<"${view_output}"; then
+            echo "npm view failed while checking ${npm_package_name}@${RELEASE_VERSION}:" >&2
+            echo "${view_output}" >&2
+            exit 1
+          fi
+
+          (cd "${node_pkg}" && npm publish --access public)
+
+  publish-npm-base:
+    name: Publish @ondeinference/onde-code
+    needs: publish-npm-binaries
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Set the release version
+        shell: bash
+        run: |
+          tag="${{ github.event.inputs.tag || github.ref_name }}"
+          echo "RELEASE_VERSION=${tag#v}" >> "$GITHUB_ENV"
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version-file: .nvmrc
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Upgrade npm for Trusted Publishing
+        shell: bash
+        run: npm install -g npm@latest
+
+      - name: Publish base package to npm
+        shell: bash
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          cd packaging/npm/onde-code
+
+          # Rewrite package.json with the release version and matching optionalDependency
+          # versions, then compile the launcher.
+          node ../scripts/render-main-package.cjs "./package.json" "${RELEASE_VERSION}"
+
+          npm install
+          npm run build
+
+          npm_package_name=$(node -p "require('./package.json').name")
+
+          # Same E404-only reading as the platform packages: a registry failure must not look
+          # like an unpublished version.
+          if view_output=$(npm view "${npm_package_name}@${RELEASE_VERSION}" version 2>&1); then
+            echo "${npm_package_name}@${RELEASE_VERSION} already exists on npm, skipping publish"
+            exit 0
+          elif ! grep -q "E404" <<<"${view_output}"; then
+            echo "npm view failed while checking ${npm_package_name}@${RELEASE_VERSION}:" >&2
+            echo "${view_output}" >&2
+            exit 1
+          fi
+
+          npm publish --access public

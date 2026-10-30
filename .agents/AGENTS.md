@@ -39,3 +39,5 @@ Things that span files:
 ## Releases
 
 Push a `v*` tag matching the `[workspace.package]` version in the root `Cargo.toml`; `release-github.yml` builds five targets (macOS arm64/x64, Linux arm64/x64, Windows x64) and attaches archives plus `checksums.txt`.
+
+`release-npm.yml` ("Code Release npm") runs on the same tag and publishes `@ondeinference/onde-code` (a Node launcher in `packaging/npm/onde-code`) plus five platform packages, `@ondeinference/onde-code-{darwin-arm64,darwin-x64,linux-x64,linux-arm64,windows-x64}`. Auth is npm Trusted Publishing; the `NPM_TOKEN` secret is only needed for a package's first publish. Verify with `npm view @ondeinference/onde-code version`.

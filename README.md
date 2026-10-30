@@ -24,6 +24,14 @@ curl -LO https://github.com/kelvin-soen/OndeCode/releases/latest/download/onde-c
 tar -xzf onde-code-darwin-arm64.tar.gz && mv onde-code ~/.local/bin/
 ```
 
+Or install from npm, which pulls in the right binary for your platform:
+
+```sh
+npm install -g @ondeinference/onde-code
+```
+
+Editors can run it without a global install: `npx @ondeinference/onde-code --acp`.
+
 Or build from source (Rust 1.88 or newer):
 
 ```sh
