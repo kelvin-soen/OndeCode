@@ -1,0 +1,41 @@
+# Onde Code
+
+Onde Code is Onde Inference's ACP-compatible coding agent for model fine-tuning and deployment.
+
+## `@ondeinference/${node_pkg}`
+
+This package is one of the platform-specific binaries behind [`@ondeinference/onde-code`](https://www.npmjs.com/package/@ondeinference/onde-code). You usually do not need to install it directly.
+
+Install the main package and npm will pull in the right binary for your OS and architecture:
+
+```sh
+npm install -g @ondeinference/onde-code
+```
+
+## Other install methods
+
+| Channel | Command |
+|---------|---------|
+| npm | `npm install -g @ondeinference/onde-code` |
+| GitHub release | archives and `checksums.txt` on the [releases page](https://github.com/kelvin-soen/OndeCode/releases) |
+| winget | `winget install OndeInference.OndeCode` |
+
+## Platform support
+
+| Platform | Architecture | Package |
+|----------|--------------|---------|
+| macOS | Apple Silicon (arm64) | [`@ondeinference/onde-code-darwin-arm64`](https://www.npmjs.com/package/@ondeinference/onde-code-darwin-arm64) |
+| macOS | Intel (x64) | [`@ondeinference/onde-code-darwin-x64`](https://www.npmjs.com/package/@ondeinference/onde-code-darwin-x64) |
+| Linux | x64 | [`@ondeinference/onde-code-linux-x64`](https://www.npmjs.com/package/@ondeinference/onde-code-linux-x64) |
+| Linux | arm64 | [`@ondeinference/onde-code-linux-arm64`](https://www.npmjs.com/package/@ondeinference/onde-code-linux-arm64) |
+| Windows | x64 | [`@ondeinference/onde-code-windows-x64`](https://www.npmjs.com/package/@ondeinference/onde-code-windows-x64) |
+
+## Links
+
+- [Homepage](https://ondeinference.com)
+- [Source code](https://github.com/kelvin-soen/OndeCode)
+- [Issues](https://github.com/kelvin-soen/OndeCode/issues)
+
+## License
+
+[Apache-2.0](https://github.com/kelvin-soen/OndeCode/blob/main/LICENSE)

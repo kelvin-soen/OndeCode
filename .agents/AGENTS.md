@@ -23,19 +23,21 @@ CI uses `--locked`, so keep `Cargo.lock` committed and current.
 
 This crate is deliberately thin. The heavy lifting lives in the Onde Agent Platform crates from crates.io: `ed-acp` (ACP server, chat completions client, workspace tools, on-disk sessions, MCP) and `ed-acp-tui` (terminal UI). This repo only supplies what makes it a *coding agent*:
 
-- `src/main.rs`: hand-rolled flag parsing and mode selection. `--setup` / `--list-models` delegate to `ed_acp::cli`. ACP mode is chosen by `--acp` or when stdin is not a TTY; otherwise it launches the TUI. `--root` is TUI-only (ACP roots come from the editor).
-- `src/profile.rs`: `OndeCode` implements `ed_acp::Profile`: `INFO` (name, `ONDE_CODE` env prefix, `ondecode` data dir name), the system prompt, toolsets (`WorkspaceTools`), and the locally answered `/models` and `/setup` slash commands.
-- `src/legacy.rs`: migrates sessions saved by Onde Code 1.0 (two files per session) into ed-acp's single-file store at ACP startup.
-- `src/bin/fake_mcp_server.rs`: a test fixture MCP server used by the integration tests.
-- `registry/`: ACP registry submission (`agent.json`, `update-agent.sh`).
+- `crates/cli/src/main.rs`: hand-rolled flag parsing and mode selection. `--setup` / `--list-models` delegate to `ed_acp::cli`. ACP mode is chosen by `--acp` or when stdin is not a TTY; otherwise it launches the TUI. `--root` is TUI-only (ACP roots come from the editor).
+- `crates/cli/src/profile.rs`: `OndeCode` implements `ed_acp::Profile`: `INFO` (name, `ONDE_CODE` env prefix, `ondecode` data dir name), the system prompt, toolsets (`WorkspaceTools`), and the locally answered `/models` and `/setup` slash commands.
+- `crates/cli/src/legacy.rs`: migrates sessions saved by Onde Code 1.0 (two files per session) into ed-acp's single-file store at ACP startup.
+- `crates/cli/src/bin/fake_mcp_server.rs`: a test fixture MCP server used by the integration tests.
+- `packaging/registry/`: ACP registry submission (`agent.json`, `update-agent.sh`).
 
 Things that span files:
 
 - **The TUI is an ACP client of itself.** `ed_acp_tui::run` spawns `onde-code --acp` as a subprocess (with `ONDE_CODE_SURFACE=tui`), so terminal and editor use the same code path. Anything that must work in both belongs on the ACP side.
 - **stdout is the ACP wire in `--acp` mode.** Logs go to stderr only (`RUST_LOG`); never `println!` in that path.
 - **Provider selection** (`LlmConfig::from_env`): `ONDE_API_KEY` wins and ignores `OPENAI_*` unless `ONDE_CODE_PROVIDER=openai`. `main` copies `OPENAI_MODEL` into `ONDE_CODE_MODEL` before the runtime starts, for 1.0 compatibility. See the README config table for all env vars.
-- **Tests** spawn the real binary over stdio against a mock chat completions server, with `ONDE_CODE_DATA_DIR` isolating the stored key and sessions (this also disables the legacy session migration). `tests/onde_live.rs` pins `ONDE_CODE_PROVIDER=onde` and strips `OPENAI_*` vars from the shell.
+- **Tests** spawn the real binary over stdio against a mock chat completions server, with `ONDE_CODE_DATA_DIR` isolating the stored key and sessions (this also disables the legacy session migration). `crates/cli/tests/onde_live.rs` pins `ONDE_CODE_PROVIDER=onde` and strips `OPENAI_*` vars from the shell.
 
 ## Releases
 
-Push a `v*` tag matching the `Cargo.toml` version; `release-github.yml` builds five targets (macOS arm64/x64, Linux arm64/x64, Windows x64) and attaches archives plus `checksums.txt`.
+Push a `v*` tag matching the `[workspace.package]` version in the root `Cargo.toml`; `release-github.yml` builds five targets (macOS arm64/x64, Linux arm64/x64, Windows x64) and attaches archives plus `checksums.txt`.
+
+`release-npm.yml` ("Code Release npm") runs on the same tag and publishes `@ondeinference/onde-code` (a Node launcher in `packaging/npm/onde-code`) plus five platform packages, `@ondeinference/onde-code-{darwin-arm64,darwin-x64,linux-x64,linux-arm64,windows-x64}`. Auth is npm Trusted Publishing; the `NPM_TOKEN` secret is only needed for a package's first publish. Verify with `npm view @ondeinference/onde-code version`.

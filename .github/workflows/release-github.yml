@@ -40,7 +40,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
-      - run: cargo build --release --locked --target ${{ matrix.target }}
+      - run: cargo build --release --locked -p onde-code --target ${{ matrix.target }}
       # The exe must not import the VC++ runtime DLLs (see .cargo/config.toml), or it fails to
       # load on a machine without the redistributable.
       - name: Check static CRT

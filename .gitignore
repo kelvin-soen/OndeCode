@@ -12,3 +12,6 @@
 .env.local
 .sigit/**/*.swp
 .playwright-mcp/
+
+# Node (npm launcher)
+node_modules/

@@ -43,7 +43,7 @@ Only needed while #652 is still open, for example to submit v1.0.0 instead of v0
 2. Wait for the `release` workflow to publish the release, then point `agent.json` at it:
 
    ```sh
-   registry/update-agent.sh v1.0.0
+   packaging/registry/update-agent.sh v1.0.0
    ```
 
    It downloads the five archives, hashes them, and writes the version, URLs and `sha256`
@@ -52,7 +52,7 @@ Only needed while #652 is still open, for example to submit v1.0.0 instead of v0
 3. In the registry fork, copy the files and validate:
 
    ```sh
-   cp ../OndeCode/registry/agent.json onde-code/agent.json
+   cp ../OndeCode/packaging/registry/agent.json onde-code/agent.json
    cp ../OndeCode/assets/icon.svg onde-code/icon.svg
    uv run --with jsonschema .github/workflows/build_registry.py
    ```
