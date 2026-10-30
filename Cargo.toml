@@ -8,18 +8,21 @@ repository = "https://github.com/kelvin-soen/OndeCode"
 
 [dependencies]
 # Onde Agent Platform: the ACP server, terminal UI and MCP layer, from the onde-ed workspace.
-ed-acp = "1.2.0"
-ed-acp-tui = "1.2.0"
+ed-acp = "1.3.5"
+ed-acp-tui = "1.3.5"
 agent-client-protocol = "2.2"
 anyhow = "1.0.104"
 async-trait = "0.1"
+base64 = "0.22"
 directories = "6.0.0"
+rand = "0.10"
+# Same features ed-acp builds it with, so the lockfile carries one copy.
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
+sha2 = "0.10"
 tokio = { version = "1.53.1", features = ["full"] }
 tracing = "0.1.44"
-
-[dev-dependencies]
 uuid = { version = "1.27.0", features = ["v4"] }
 
 [[bin]]

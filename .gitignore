@@ -11,3 +11,4 @@
 .env
 .env.local
 .sigit/**/*.swp
+.playwright-mcp/
