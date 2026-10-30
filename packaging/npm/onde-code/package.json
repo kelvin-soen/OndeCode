@@ -1,0 +1,41 @@
+{
+  "name": "@ondeinference/onde-code",
+  "version": "0.0.0-dev",
+  "keywords": [
+    "cli",
+    "ai",
+    "coding-agent",
+    "llm",
+    "acp",
+    "onde"
+  ],
+  "bin": {
+    "onde-code": "lib/index.js"
+  },
+  "files": [
+    "lib",
+    "README.md"
+  ],
+  "description": "Onde Code is Onde Inference's ACP-compatible coding agent for model fine-tuning and deployment.",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/kelvin-soen/OndeCode.git"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "build": "tsc",
+    "dev": "npm run build && node lib/index.js"
+  },
+  "devDependencies": {
+    "@types/node": "^18.15.11",
+    "typescript": "^5.0.0"
+  },
+  "optionalDependencies": {
+    "@ondeinference/onde-code-darwin-arm64": "0.0.0-dev",
+    "@ondeinference/onde-code-darwin-x64": "0.0.0-dev",
+    "@ondeinference/onde-code-linux-arm64": "0.0.0-dev",
+    "@ondeinference/onde-code-linux-x64": "0.0.0-dev",
+    "@ondeinference/onde-code-windows-x64": "0.0.0-dev"
+  }
+}
