@@ -27,7 +27,7 @@ This crate is deliberately thin. The heavy lifting lives in the Onde Agent Platf
 - `crates/cli/src/profile.rs`: `OndeCode` implements `ed_acp::Profile`: `INFO` (name, `ONDE_CODE` env prefix, `ondecode` data dir name), the system prompt, toolsets (`WorkspaceTools`), and the locally answered `/models` and `/setup` slash commands.
 - `crates/cli/src/legacy.rs`: migrates sessions saved by Onde Code 1.0 (two files per session) into ed-acp's single-file store at ACP startup.
 - `crates/cli/src/bin/fake_mcp_server.rs`: a test fixture MCP server used by the integration tests.
-- `registry/`: ACP registry submission (`agent.json`, `update-agent.sh`).
+- `packaging/registry/`: ACP registry submission (`agent.json`, `update-agent.sh`).
 
 Things that span files:
 

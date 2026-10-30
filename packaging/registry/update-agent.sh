@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Point registry/agent.json at a published release: set the version, the archive URLs and the
+# Point packaging/registry/agent.json at a published release: set the version, the archive URLs and the
 # sha256 of each archive. The archives are downloaded and hashed here rather than trusting
 # checksums.txt, which releases before v1.0.0 don't have.
 #
-#   registry/update-agent.sh v1.0.0
+#   packaging/registry/update-agent.sh v1.0.0
 set -euo pipefail
 
-tag=${1:?usage: registry/update-agent.sh <tag, e.g. v1.0.0>}
+tag=${1:?usage: packaging/registry/update-agent.sh <tag, e.g. v1.0.0>}
 repo=kelvin-soen/OndeCode
 here=$(cd "$(dirname "$0")" && pwd)
 dist=$(mktemp -d)
@@ -33,4 +33,4 @@ for entry in "${platforms[@]}"; do
     '.distribution.binary[$p].archive = $u | .distribution.binary[$p].sha256 = $s' <<<"$json")
 done
 printf '%s\n' "$json" > "$here/agent.json"
-echo "registry/agent.json now points at $tag"
+echo "packaging/registry/agent.json now points at $tag"

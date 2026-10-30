@@ -202,7 +202,7 @@ need no API key or network. `crates/cli/tests/acp_integration.rs` drives the age
 | `crates/cli/src/profile.rs` | the coding agent's prompt, tools and `/models` and `/setup` commands |
 | `crates/cli/src/auth.rs`, `crates/cli/src/browser_auth.rs` | "Sign in with Onde" and `--login`: loopback + PKCE against ondeinference.com/connect |
 | `crates/cli/src/legacy.rs` | moves sessions saved by Onde Code 1.0 into the current store |
-| `registry/` | the first ACP registry submission; later releases are picked up by the registry |
+| `packaging/registry/` | the first ACP registry submission; later releases are picked up by the registry |
 
 The ACP server, the chat completions client, the workspace tools, sessions on disk, MCP servers and
 the terminal UI come from the Onde Agent Platform crates
